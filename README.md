@@ -306,7 +306,7 @@ src/
 
 The EQ runs **on the bridge**, not the PC (that's the whole point — it works from
 a phone/tablet with no software). `src/dsp_peq.c` is a stereo chain of up to
-`PEQ_MAX_BANDS` (10) RBJ-cookbook biquads in float32, with a global **pre-gain**
+`PEQ_MAX_BANDS` (16) state-variable filters in float32, with a global **pre-gain**
 (headroom) stage in front and the **host volume** applied at the end:
 
 ```

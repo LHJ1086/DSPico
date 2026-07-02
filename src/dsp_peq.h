@@ -20,7 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define PEQ_MAX_BANDS 10
+#define PEQ_MAX_BANDS 16
 
 // --- Allowed parameter ranges (enforced by peq_set_band) --------------------
 // Frequency 1 Hz .. 20 kHz, band gain +/-12 dB (peaking/shelf), Q 0.1 .. 10.
