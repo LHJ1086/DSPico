@@ -1,0 +1,22 @@
+# Build output
+build/
+*.uf2
+*.elf
+*.bin
+*.hex
+*.dis
+*.map
+
+# CMake
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local vendored deps for compile checks (not committed)
+vendor/
