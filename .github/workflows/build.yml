@@ -1,0 +1,57 @@
+name: Build firmware
+
+# Compiles the RP2350 firmware for real: fetches the ARM toolchain, the Pico SDK
+# (with its bundled TinyUSB) and Pico-PIO-USB, then builds the UF2. This is the
+# compile check that can't run in the authoring sandbox, so it validates the USB
+# glue (descriptors, UAC2 device, PIO host, WebUSB vendor protocol) too.
+
+on:
+  push:
+    branches: [main, 'claude/**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout DSPico
+        uses: actions/checkout@v4
+
+      - name: Install ARM toolchain + build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build python3 build-essential pkg-config \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib \
+            libusb-1.0-0-dev
+
+      - name: Checkout Pico SDK (with submodules for TinyUSB)
+        uses: actions/checkout@v4
+        with:
+          repository: raspberrypi/pico-sdk
+          ref: 2.1.1
+          path: pico-sdk
+          submodules: recursive
+
+      - name: Fetch Pico-PIO-USB
+        run: ./setup.sh
+
+      - name: Configure
+        env:
+          PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
+        run: cmake -B build -G Ninja -DPICO_BOARD=pico2
+
+      - name: Build
+        run: cmake --build build --verbose
+
+      - name: Show build outputs
+        run: ls -l build/dspico.uf2 build/dspico.elf
+
+      - name: Upload UF2 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dspico-firmware
+          path: |
+            build/dspico.uf2
+            build/dspico.elf
