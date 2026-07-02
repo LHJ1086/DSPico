@@ -21,10 +21,13 @@
 #define DSPICO_RHPORT_HOST   1
 
 // --- PIO-USB data pins (Type-C2) -------------------------------------------
-// The schematic wires D- = GPIO12 and D+ = GPIO13. Pico-PIO-USB's config takes
-// the D+ pin and assumes D- = D+ + 1 by default (ascending). This board has the
-// pins REVERSED (D+ is the higher pin), so we must set D+ = GPIO13 and enable
-// the DP/DM swap so the library drives the correct polarity (brief §3b).
+// The schematic wires D- = GPIO12 and D+ = GPIO13 (same on the -C and -CM
+// variants). Pico-PIO-USB's config takes the D+ pin and assumes D- = D+ + 1 by
+// default (ascending). This board has the pins REVERSED (D+ is the higher pin),
+// so we must set D+ = GPIO13 and enable the DP/DM swap so the library drives the
+// correct polarity (brief §3b). Note: the ~1.5 kOhm D+ pull-up may need
+// removing for host mode — see docs/hardware-fix.md (net, not label: it is R13
+// on RP2350-USB-C, R10 on RP2350-USB-CM).
 #define DSPICO_PIO_USB_DP_PIN 13   // GPIO13 = D+
 // D- is DP-1 = GPIO12 once the swap flag below is applied.
 #define DSPICO_PIO_USB_PINOUT_DPDM_SWAP 1

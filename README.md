@@ -42,18 +42,34 @@ clock-domain feedback tuning (Phase 4), and robustness/hot-plug (Phase 5).
 
 ---
 
-## Hardware mods (do these first — brief §3)
+## Hardware mods — see [`docs/hardware-fix.md`](docs/hardware-fix.md)
 
-The PIO port (Type-C2) ships wired "device-leaning". For **host** mode:
+> **Golden rule: don't mod the board until the software tells you to.** Flash
+> Phase 0 first. The PIO port often works as-shipped — only do the mod below
+> **if the host port fails to enumerate the DAC.**
 
-1. **Remove R10** (1.5 kΩ pull-up on D+ / GPIO13). If the DAC still isn't
-   detected or hot-plug is flaky, add ~15 kΩ pull-downs on D+ and D−.
-2. Prefer a **self-powered DAC** — there is no VBUS switch/limit on the PIO port.
-3. A DAC with a **captive or Type-A cable** avoids Type-C CC negotiation issues
-   (the PIO port advertises Rd/sink, not a source).
+The PIO port (Type-C2) ships "device-leaning": a 1.5 kΩ pull-up on D+ → 3V3,
+which fights the DAC's pull-up and corrupts the idle line when we act as host.
+
+1. If (and only if) host enumeration fails: **remove the 1.5 kΩ D+ pull-up.**
+   Waveshare swaps this resistor's designator between board variants, so
+   **trust the net, not the label** — remove whichever ~1.5 kΩ part sits between
+   the Type-C2 **D+ (GPIO13)** line and **3V3**, after confirming with a meter:
+
+   | Board variant | 1.5 kΩ D+ pull-up to remove | Empty footprint |
+   |---------------|-----------------------------|-----------------|
+   | **RP2350-USB-C**  | **R13** | R10 (NC) |
+   | RP2350-USB-CM     | **R10** | R13 (NC) |
+
+2. Still flaky / misses hot-plug? Add **~15 kΩ pull-downs** on D+ → GND and
+   D− → GND.
+3. Use a **self-powered DAC** — there is no VBUS switch/limit on the PIO port.
+   A **captive or Type-A-cabled** DAC also avoids Type-C CC negotiation issues.
+4. Leave the 27 Ω series resistors and the CC pull-downs alone — they're correct.
 
 The firmware already handles the reversed pin order (D− = GPIO12, D+ = GPIO13)
-via `DSPICO_PIO_USB_PINOUT_DPDM_SWAP` in `src/board_config.h`.
+via `DSPICO_PIO_USB_PINOUT_DPDM_SWAP` in `src/board_config.h` — this is config,
+not a solder fix, and is identical for both the -C and -CM variants.
 
 ---
 
@@ -113,6 +129,7 @@ green (streaming to DAC).
 CMakeLists.txt          top-level build (SDK + Pico-PIO-USB + pioasm for LED)
 pico_sdk_import.cmake    standard SDK locator
 setup.sh                 clones lib/Pico-PIO-USB
+docs/hardware-fix.md     board solder mods + meter-verify + decision flow
 src/
   board_config.h         pins, 120 MHz clock, locked audio format
   tusb_config.h          TinyUSB config for BOTH device + host stacks
