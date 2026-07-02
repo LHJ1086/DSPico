@@ -291,11 +291,12 @@ static uint8_t const desc_ms_os_20[] = {
 };
 TU_VERIFY_STATIC(sizeof(desc_ms_os_20) == MS_OS_20_DESC_LEN, "MS OS 2.0 length mismatch");
 
-// WebUSB URL descriptor (landing page shown by Chrome). Host your copy of the
-// config page and point this at it; https scheme code = 1.
+// WebUSB URL descriptor (landing page shown by Chrome). Points at the GitHub
+// Pages deployment of web/. Host + path only; https scheme code = 1.
 static const uint8_t desc_url[] = {
-    3 + 17, 3, 1,  // bLength, bDescriptorType (URL), bScheme (1 = https)
+    3 + 25, 3, 1,  // bLength, bDescriptorType (URL), bScheme (1 = https)
     'l','h','j','1','0','8','6','.','g','i','t','h','u','b','.','i','o',
+    '/','D','S','P','i','c','o','/',
 };
 
 const uint8_t *dspico_desc_ms_os_20(uint16_t *len) {

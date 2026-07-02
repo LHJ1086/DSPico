@@ -378,7 +378,11 @@ Chrome / Edge / Chromium. It works **standalone** (design a curve, import an
 AutoEQ preset, see the response, save/load JSON) and **connected** (push bands +
 pre-gain live over WebUSB, load the device's state, commit to flash).
 
-**Serve it** (WebUSB needs https or localhost):
+**Hosted:** pushed to GitHub Pages at **https://lhj1086.github.io/DSPico/**
+(auto-deployed from `web/` by `.github/workflows/pages.yml`). This is the URL the
+device advertises as its WebUSB landing page.
+
+**Or serve locally** (WebUSB needs https or localhost):
 
 ```bash
 cd web && python3 -m http.server 8000
