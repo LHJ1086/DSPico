@@ -106,8 +106,9 @@ static void parse_audio_function(dac_dev_t *d, uint8_t const *p, uint16_t len) {
 // ---------------------------------------------------------------------------
 // TinyUSB host class-driver callbacks
 // ---------------------------------------------------------------------------
-static void dac_init(void) {
+static bool dac_init(void) {
   memset(&s_dac, 0, sizeof(s_dac));
+  return true;
 }
 
 static bool dac_open(uint8_t rhport, uint8_t dev_addr,

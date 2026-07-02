@@ -17,6 +17,16 @@
 #define USB_PID   0xD590
 #define USB_BCD   0x0200   // USB 2.0 device, Full Speed
 
+// String descriptor indices (referenced by the config descriptor below, so
+// defined up here before it).
+enum {
+  STRID_LANGID = 0,
+  STRID_MANUFACTURER,
+  STRID_PRODUCT,
+  STRID_SERIAL,
+  STRID_VENDOR,
+};
+
 // ---------------------------------------------------------------------------
 // Device descriptor
 // ---------------------------------------------------------------------------
@@ -139,8 +149,13 @@ static uint8_t const desc_configuration[] = {
                                 /*_lockdelayunit*/ AUDIO_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_UNDEFINED,
                                 /*_lockdelay*/ 0x0000),
 
-    // --- Isochronous feedback IN endpoint -----------------------------------
-    TUD_AUDIO_DESC_STD_AS_ISO_FB_EP(/*_ep*/ EPNUM_AUDIO_FB, /*_interval*/ 0x01),
+    // --- Isochronous feedback IN endpoint (hand-written 7-byte EP; the
+    //     TUD_AUDIO_DESC_STD_AS_ISO_FB_EP macro's arg count varies by TinyUSB
+    //     version, so we emit the standard UAC2 feedback endpoint directly) ---
+    7, TUSB_DESC_ENDPOINT, EPNUM_AUDIO_FB,
+    (uint8_t)(TUSB_XFER_ISOCHRONOUS | TUSB_ISO_EP_ATT_NO_SYNC | TUSB_ISO_EP_ATT_EXPLICIT_FB),
+    U16_TO_U8S_LE(4),   // wMaxPacketSize = 4 (feedback value)
+    0x01,               // bInterval
 
     // --- Vendor interface: the WebUSB EQ config channel (brief §6b) ----------
     TUD_VENDOR_DESCRIPTOR(ITF_NUM_VENDOR, STRID_VENDOR, EPNUM_VENDOR_OUT, EPNUM_VENDOR_IN, 64),
@@ -159,14 +174,6 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
 // ---------------------------------------------------------------------------
 // String descriptors
 // ---------------------------------------------------------------------------
-enum {
-  STRID_LANGID = 0,
-  STRID_MANUFACTURER,
-  STRID_PRODUCT,
-  STRID_SERIAL,
-  STRID_VENDOR,
-};
-
 static char const *string_desc_arr[] = {
     (const char[]){0x09, 0x04},  // 0: supported language = English (0x0409)
     "DSPico",                    // 1: Manufacturer
