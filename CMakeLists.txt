@@ -38,7 +38,16 @@ add_executable(dspico
     src/dsp_peq.c
     src/signal_path.c
     src/config_usb.c
+    # TinyUSB <-> Pico-PIO-USB glue: provides the hcd_* host-controller driver
+    # for rhport 1 (CFG_TUH_RPI_PIO_USB). The dcd_ half self-gates off — we use
+    # the native controller for the device side. The pico-sdk does not create a
+    # tinyusb_pico_pio_usb target, so we add these portable sources directly.
+    ${PICO_TINYUSB_PATH}/src/portable/raspberrypi/pio_usb/dcd_pio_usb.c
+    ${PICO_TINYUSB_PATH}/src/portable/raspberrypi/pio_usb/hcd_pio_usb.c
 )
+
+# Tell Pico-PIO-USB it is being driven through TinyUSB's hcd/dcd glue.
+target_compile_definitions(dspico PRIVATE PIO_USB_USE_TINYUSB)
 
 # Generate ws2812.pio.h from the PIO source (uses the SDK's pioasm).
 pico_generate_pio_header(dspico ${CMAKE_CURRENT_LIST_DIR}/src/ws2812.pio)

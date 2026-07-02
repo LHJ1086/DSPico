@@ -13,6 +13,8 @@
 #ifndef DSPICO_USB_DESCRIPTORS_H
 #define DSPICO_USB_DESCRIPTORS_H
 
+#include <stdint.h>   // this header is pulled in early via tusb_config.h
+
 // --- Interface numbers -----------------------------------------------------
 enum {
   ITF_NUM_AUDIO_CONTROL = 0,

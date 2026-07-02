@@ -20,3 +20,5 @@ CMakeFiles/
 
 # Local vendored deps for compile checks (not committed)
 vendor/
+# Pico-PIO-USB, fetched by ./setup.sh
+lib/
