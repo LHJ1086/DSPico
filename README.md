@@ -14,31 +14,32 @@ full design.
 
 ---
 
-## ⚠️ Current status: Phase 0 + Phase 1 only
+## ⚠️ Current status
 
-Per the build brief (§8, §11) this repository stops at the **Phase 1b hardware
-go/no-go gate**. The one unproven assumption — *can we stream isochronous USB
-audio as a host over the bit-banged PIO port?* — must be validated on real
-hardware with a logic analyzer **before** the rest of the bridge is built.
+The **on-device parametric EQ is implemented and unit-tested**, and the full
+PC → EQ → DAC signal path is wired. What is *not yet proven* is the one thing the
+brief flagged as the risk: streaming isochronous audio as a host over the
+bit-banged PIO port. That must be validated on real hardware (the Phase 1b gate)
+before end-to-end audio can be trusted — but it does **not** block the EQ, which
+is pure on-core DSP and runs regardless.
 
-What is implemented here:
+| Area | Status | Where |
+|------|--------|-------|
+| Dual-stack skeleton: device (core0) + PIO host (core1), 120 MHz, PIO polarity | ✅ implemented | `src/main.c`, `src/board_config.h` |
+| **UAC2 output** — 48 kHz/24-bit stereo, no capture, Volume + Mute Feature Unit | ✅ implemented | `src/usb_descriptors.*`, `src/uac2_device.c` |
+| **On-device parametric EQ** — N-band stereo biquads, pre-gain, host-volume, RBJ coefficients | ✅ implemented + **unit-tested** | `src/dsp_peq.*` |
+| **Signal path** — PC audio → pre-gain → PEQ → host volume → cross-core ring → DAC | ✅ implemented + **unit-tested** | `src/signal_path.*`, `src/audio_ring.h` |
+| PIO **host** streams iso OUT to a DAC (test tone when idle) | ⚠️ **needs the hardware gate** | `src/uac_host.c`, `src/test_tone.c` |
+| WebUSB configurator (edit bands from a browser) | ⛔ not yet (Phase 3) | — |
+| Clock-domain feedback tuning; hot-plug/suspend robustness | ⛔ not yet (Phase 4/5) | — |
 
-| Phase | What it does | Where |
-|-------|--------------|-------|
-| **0** | Dual-stack skeleton: native USB **device** on core0 + PIO-USB **host** on core1, 120 MHz clock, correct PIO pin polarity | `src/main.c`, `src/board_config.h` |
-| **1a** | Native side enumerates as a **UAC2 output** — 48 kHz/24-bit stereo, **no capture**, Feature Unit with **Volume + Mute**; received audio is accepted and discarded | `src/usb_descriptors.*`, `src/uac2_device.c` |
-| **1b** | PIO **host** enumerates one class-compliant DAC, sets 48 kHz, opens its **isochronous OUT** endpoint, and streams a firmware-generated **1 kHz test tone** | `src/uac_host.c`, `src/test_tone.c` |
-
-**Not yet built** (deliberately): the PC→DAC passthrough (Phase 2), the biquad
-PEQ + pre-gain + host-volume DSP (Phase 3), the WebUSB configurator (Phase 3),
-clock-domain feedback tuning (Phase 4), and robustness/hot-plug (Phase 5).
-
-> Honesty note: this firmware could not be compiled in the authoring
-> environment (no ARM toolchain / SDK access there). It is written against the
-> TinyUSB bundled with **Pico SDK 2.1.1** and Pico-PIO-USB `master`. Expect to
-> compile it during Phase 1a bring-up and iron out any version-specific macro
-> details — the UAC2 descriptor macros in particular are version-sensitive, and
-> the iso-over-PIO data path in `uac_host.c` is the explicit experimental risk.
+> Honesty note: the **DSP and signal-path code is verified** — compiled with the
+> native compiler and checked numerically (see *Verifying the DSP* below). The
+> **USB-glue code could not be compiled here** (this environment can't fetch the
+> Pico SDK / TinyUSB / Pico-PIO-USB). It targets the TinyUSB in **Pico SDK 2.1.1**
+> and Pico-PIO-USB `master`; expect to iron out version-specific macro details at
+> first compile, and note the iso-over-PIO path in `uac_host.c` is the
+> experimental risk.
 
 ---
 
@@ -288,18 +289,76 @@ src/
   board_config.h         pins, 120 MHz clock, locked audio format
   tusb_config.h          TinyUSB config for BOTH device + host stacks
   usb_descriptors.[ch]   UAC2 speaker descriptors (Feature Unit, feedback EP)
-  uac2_device.c          device audio callbacks: vol/mute, drain, feedback
+  uac2_device.c          device audio callbacks: vol/mute, RX->signal path
   uac_host.[ch]          custom UAC *host* driver over Pico-PIO-USB (Phase 1b)
-  test_tone.[ch]         48 kHz / 24-bit sine generator
+  dsp_peq.[ch]           on-device parametric EQ engine (RBJ biquads)  <<<
+  signal_path.[ch]       pre-gain -> PEQ -> host volume -> play ring    <<<
+  audio_ring.h           lock-free cross-core SPSC audio ring
+  test_tone.[ch]         48 kHz / 24-bit sine generator (idle/gate fallback)
   status_led.[ch]        WS2812 state indicator (on PIO2, no conflict)
   ws2812.pio             LED PIO program (assembled at build time)
-  main.c                 clock, dual-core split, both stacks
+  main.c                 clock, dual-core split, both stacks, EQ wiring
 ```
+
+---
+
+## On-device parametric EQ
+
+The EQ runs **on the bridge**, not the PC (that's the whole point — it works from
+a phone/tablet with no software). `src/dsp_peq.c` is a stereo chain of up to
+`PEQ_MAX_BANDS` (10) RBJ-cookbook biquads in float32, with a global **pre-gain**
+(headroom) stage in front and the **host volume** applied at the end:
+
+```
+PC audio → PRE-GAIN → biquad[0..N) → HOST VOLUME → DAC
+```
+
+Band types: **peaking**, **low-shelf**, **high-shelf**, **low-pass**,
+**high-pass** — each with frequency, gain (dB), and Q. The device computes the
+coefficients (it is the source of truth); a future WebUSB app only sends the
+high-level band parameters.
+
+**Setting a filter today** (until the WebUSB configurator lands, edit `main.c`):
+
+```c
+signal_path_set_pre_gain_db(-6.0f);                 // headroom for the boost
+peq_band_t b = { .enabled = true, .type = PEQ_PEAKING,
+                 .fc = 1000.0f, .gain_db = -6.0f, .q = 1.0f };
+signal_path_set_band(0, &b);                         // band slot 0
+```
+
+A commented copy of exactly this (the brief's acceptance-test filter) sits in
+`main.c` ready to uncomment. Volume/mute from the OS is applied automatically.
+
+### Verifying the DSP (no hardware needed)
+
+The EQ and signal-path modules are plain C and were validated with the native
+compiler. To reproduce:
+
+```bash
+# frequency response of designed filters (peaking/shelf/pre-gain/multi-band):
+gcc -O2 -Wall -o peq_test  peq_test.c  src/dsp_peq.c -lm && ./peq_test
+# capture -> EQ -> ring -> play, incl. odd chunk sizes + wraparound:
+gcc -O2 -Wall -o path_test path_test.c src/signal_path.c src/dsp_peq.c -lm && ./path_test
+```
+
+Measured results: peaking/shelf gains land within ~0.15 dB of target at Fc and
+are flat elsewhere; pre-gain scales exactly; a flat EQ is bit-transparent; and
+640k frames survive ring wraparound with zero ordering errors. (Test drivers
+live under the repo's development notes — ask if you want them committed to a
+`tests/` folder with a runner.)
+
+---
 
 ## Next steps (after the gate passes)
 
-Phase 2 wires the two stacks together: forward device-side received audio (the
-`tud_audio_rx_done_post_read_cb` hook) into a capture ring, drain it from a play
-ring in the host's `uac_host_fill_cb_t` source, replacing the test tone. Then
-Phase 3 inserts pre-gain → biquad PEQ → host-volume and adds the WebUSB config
-interface.
+The DSP is done. What remains is gated on Phase 1b:
+
+- **Phase 4 — clock sync:** the capture (PC) and play (DAC) rates differ slightly;
+  the async feedback endpoint already slaves the PC to us, but tune it against
+  the real DAC FIFO level so the ring neither starves nor overflows over hours.
+- **Phase 3 — WebUSB configurator:** a static HTML/JS page that edits bands +
+  pre-gain live over the vendor interface (needs a small vendor endpoint added to
+  the device descriptors). This can be built now against a stubbed protocol.
+- **Phase 5 — robustness:** DAC hot-plug, PC suspend/resume, flash-persisted
+  presets, richer LED states.

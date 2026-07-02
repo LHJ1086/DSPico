@@ -23,11 +23,18 @@
 #include "uac2_device.h"
 #include "uac_host.h"
 #include "test_tone.h"
+#include "signal_path.h"
 
-// Adapt the tone generator to the host driver's fill-callback signature.
-static size_t test_tone_source(uint8_t *dst, size_t max_frames) {
-  test_tone_fill(dst, max_frames);
-  return max_frames;
+// The audio the host streams to the DAC: EQ'd PC audio from the play ring when
+// the PC is streaming, otherwise the firmware test tone (keeps the DAC fed and
+// lets the Phase 1b gate run with no PC attached).
+static size_t audio_source(uint8_t *dst, size_t max_frames) {
+  size_t frames = signal_path_pull_play(dst, max_frames);
+  if (frames == 0) {
+    test_tone_fill(dst, max_frames);
+    frames = max_frames;
+  }
+  return frames;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,9 +72,22 @@ int main(void) {
 
   printf("\nDSPico — Phase 0/1 firmware, sysclk=%lu kHz\n", (unsigned long) DSPICO_SYS_CLK_KHZ);
 
-  // Phase 1b source: a 1 kHz, -6 dBFS tone streamed to the DAC.
+  // On-device signal path (PEQ engine + play ring). Flat by default; the UAC2
+  // volume callback and the future WebUSB handler configure it live.
+  signal_path_init();
+
+  // Example: hard-code an EQ preset until the WebUSB configurator lands. This is
+  // the brief's acceptance-test filter (a -6 dB dip @ 1 kHz with -6 dB pre-gain).
+  // Uncomment to hear/measure the on-device EQ working end-to-end.
+  //
+  // signal_path_set_pre_gain_db(-6.0f);
+  // peq_band_t demo = { .enabled = true, .type = PEQ_PEAKING,
+  //                     .fc = 1000.0f, .gain_db = -6.0f, .q = 1.0f };
+  // signal_path_set_band(0, &demo);
+
+  // Idle/gate fallback tone, and the DAC audio source.
   test_tone_config(1000.0f, -6.0f);
-  uac_host_set_source(test_tone_source);
+  uac_host_set_source(audio_source);
 
   // Launch the PIO-USB host on core1.
   multicore_reset_core1();

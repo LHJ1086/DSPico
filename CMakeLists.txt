@@ -35,6 +35,8 @@ add_executable(dspico
     src/uac_host.c
     src/test_tone.c
     src/status_led.c
+    src/dsp_peq.c
+    src/signal_path.c
 )
 
 # Generate ws2812.pio.h from the PIO source (uses the SDK's pioasm).

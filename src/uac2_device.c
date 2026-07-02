@@ -13,6 +13,7 @@
 #include "board_config.h"
 #include "usb_descriptors.h"
 #include "uac2_device.h"
+#include "signal_path.h"
 
 // --- Volume / mute state ---------------------------------------------------
 // UAC2 volume is signed 16-bit in 1/256 dB steps. We advertise -60..0 dB.
@@ -45,6 +46,10 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
 
   if (itf == ITF_NUM_AUDIO_STREAMING) {
     s_streaming = (alt != 0);   // alt 1 = operational, alt 0 = zero bandwidth
+    if (s_streaming) {
+      signal_path_on_stream_start();               // clear filter history
+      signal_path_set_host_gain(uac2_host_gain()); // apply current volume/mute
+    }
   }
   return true;
 }
@@ -59,7 +64,8 @@ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const 
 }
 
 // ---------------------------------------------------------------------------
-// Received audio: Phase 1a drains and discards it (brief §8, 1a).
+// Received audio: run it through the on-device signal path (pre-gain -> PEQ ->
+// host volume) and push it to the play ring for the DAC (brief §5).
 // ---------------------------------------------------------------------------
 bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received,
                                     uint8_t func_id, uint8_t ep_out, uint8_t cur_alt_setting) {
@@ -72,7 +78,7 @@ bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received,
     const uint16_t got = tud_audio_read(scratch, chunk);
     if (got == 0) break;
     remaining -= got;
-    // Phase 2 hook: forward `scratch`/`got` into the capture ring here.
+    signal_path_push_capture(scratch, got);   // EQ + enqueue toward the DAC
   }
   return true;
 }
@@ -170,10 +176,12 @@ bool tud_audio_set_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p
 
   if (ctrl_sel == AUDIO_FU_CTRL_MUTE) {
     s_mute[channel] = ((audio_control_cur_1_t const *) buf)->bCur;
+    signal_path_set_host_gain(uac2_host_gain());
     return true;
   }
   if (ctrl_sel == AUDIO_FU_CTRL_VOLUME) {
     s_volume_db256[channel] = (int16_t) tu_le16toh(((audio_control_cur_2_t const *) buf)->bCur);
+    signal_path_set_host_gain(uac2_host_gain());
     return true;
   }
   return false;
