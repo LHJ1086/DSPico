@@ -27,7 +27,7 @@ is pure on-core DSP and runs regardless.
 |------|--------|-------|
 | Dual-stack skeleton: device (core0) + PIO host (core1), 120 MHz, PIO polarity | ✅ implemented | `src/main.c`, `src/board_config.h` |
 | **UAC2 output** — 48 kHz/24-bit stereo, no capture, Volume + Mute Feature Unit | ✅ implemented | `src/usb_descriptors.*`, `src/uac2_device.c` |
-| **On-device parametric EQ** — N-band stereo biquads, pre-gain, host-volume, RBJ coefficients | ✅ implemented + **unit-tested** | `src/dsp_peq.*` |
+| **On-device parametric EQ** — N-band stereo SVF, 1 Hz–20 kHz, ±12 dB, Q 0.1–10, pre-gain, host-volume | ✅ implemented + **unit-tested** | `src/dsp_peq.*` |
 | **Signal path** — PC audio → pre-gain → PEQ → host volume → cross-core ring → DAC | ✅ implemented + **unit-tested** | `src/signal_path.*`, `src/audio_ring.h` |
 | PIO **host** streams iso OUT to a DAC (test tone when idle) | ⚠️ **needs the hardware gate** | `src/uac_host.c`, `src/test_tone.c` |
 | WebUSB configurator (edit bands from a browser) | ⛔ not yet (Phase 3) | — |
@@ -318,6 +318,21 @@ Band types: **peaking**, **low-shelf**, **high-shelf**, **low-pass**,
 coefficients (it is the source of truth); a future WebUSB app only sends the
 high-level band parameters.
 
+**Parameter ranges** (enforced by `peq_set_band` — out-of-range values are
+clamped; constants live in `dsp_peq.h`):
+
+| Parameter | Range |
+|-----------|-------|
+| Frequency (Fc) | **1 Hz – 20 kHz** |
+| Gain (peaking / shelf) | **−12 … +12 dB** |
+| Q | **0.1 … 10** |
+
+Each band is a **TPT state-variable filter** (Andrew Simper / Cytomic), not a
+Direct-Form biquad. This matters for the low end: a float32 DF biquad collapses
+near 1 Hz (its `cos(w0)` rounds to 1.0), whereas the SVF stays accurate — a
++6 dB band at 1 Hz measures **+6.00 dB**, and full ±12 dB at Q 0.1–10 is exact
+across 1 Hz–20 kHz. Same per-sample cost.
+
 **Setting a filter today** (until the WebUSB configurator lands, edit `main.c`):
 
 ```c
@@ -343,10 +358,12 @@ gcc -O2 -Wall -o path_test path_test.c src/signal_path.c src/dsp_peq.c -lm && ./
 ```
 
 Measured results: peaking/shelf gains land within ~0.15 dB of target at Fc and
-are flat elsewhere; pre-gain scales exactly; a flat EQ is bit-transparent; and
-640k frames survive ring wraparound with zero ordering errors. (Test drivers
-live under the repo's development notes — ask if you want them committed to a
-`tests/` folder with a runner.)
+are flat elsewhere; **the full range is exact — a +6 dB band reads +6.00 dB at
+1 Hz and at 20 kHz, and ±12 dB holds across Q 0.1–10**; out-of-range params clamp
+correctly; pre-gain scales exactly; a flat EQ is bit-transparent; and 640k frames
+survive ring wraparound with zero ordering errors. (Test drivers live under the
+repo's development notes — ask if you want them committed to a `tests/` folder
+with a runner.)
 
 ---
 

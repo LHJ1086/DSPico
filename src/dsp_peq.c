@@ -13,76 +13,52 @@
 #define S24_POS_FULL_SCALE  8388607.0f    //  2^23 - 1
 #define S24_NEG_FULL_SCALE  8388608.0f    //  2^23
 
-// Identity biquad: y = x.
-static void coeffs_bypass(biquad_coeffs_t *c) {
-  c->b0 = 1.0f; c->b1 = 0.0f; c->b2 = 0.0f; c->a1 = 0.0f; c->a2 = 0.0f;
+// Identity SVF: out = v0 (m1 = m2 = 0).
+static void coeffs_bypass(svf_coeffs_t *c) {
+  c->a1 = 0.0f; c->a2 = 0.0f; c->a3 = 0.0f;
+  c->m0 = 1.0f; c->m1 = 0.0f; c->m2 = 0.0f;
 }
 
-// Compute a0-normalised coefficients for one band (RBJ cookbook).
-static void design_band(const peq_band_t *b, float fs, biquad_coeffs_t *c) {
+// Compute TPT-SVF coefficients for one band (Cytomic / Andrew Simper,
+// "Solving the continuous SVF equations using trapezoidal integration").
+static void design_band(const peq_band_t *b, float fs, svf_coeffs_t *c) {
   if (!b->enabled || b->fc <= 0.0f || b->fc >= fs * 0.5f || b->q <= 0.0f) {
     coeffs_bypass(c);
     return;
   }
 
-  const float A     = powf(10.0f, b->gain_db / 40.0f);   // amplitude (peaking/shelf)
-  const float w0    = 2.0f * (float) M_PI * b->fc / fs;
-  const float cosw0 = cosf(w0);
-  const float sinw0 = sinf(w0);
-  const float alpha = sinw0 / (2.0f * b->q);
-
-  float b0, b1, b2, a0, a1, a2;
+  const float A     = powf(10.0f, b->gain_db / 40.0f);   // shelf/bell amplitude
+  const float w     = (float) M_PI * b->fc / fs;         // prewarp argument
+  float g = tanf(w);                                      // prewarped frequency
+  float k;
+  float m0, m1, m2;
 
   switch (b->type) {
-    case PEQ_PEAKING:
-      b0 = 1.0f + alpha * A;
-      b1 = -2.0f * cosw0;
-      b2 = 1.0f - alpha * A;
-      a0 = 1.0f + alpha / A;
-      a1 = -2.0f * cosw0;
-      a2 = 1.0f - alpha / A;
+    case PEQ_PEAKING:                                     // "bell"
+      k  = 1.0f / (b->q * A);
+      m0 = 1.0f; m1 = k * (A * A - 1.0f); m2 = 0.0f;
       break;
 
-    case PEQ_LOWSHELF: {
-      const float ap1 = A + 1.0f, am1 = A - 1.0f;
-      const float twoSqrtAalpha = 2.0f * sqrtf(A) * alpha;
-      b0 =        A * (ap1 - am1 * cosw0 + twoSqrtAalpha);
-      b1 =  2.0f * A * (am1 - ap1 * cosw0);
-      b2 =        A * (ap1 - am1 * cosw0 - twoSqrtAalpha);
-      a0 =            (ap1 + am1 * cosw0 + twoSqrtAalpha);
-      a1 = -2.0f *    (am1 + ap1 * cosw0);
-      a2 =            (ap1 + am1 * cosw0 - twoSqrtAalpha);
+    case PEQ_LOWSHELF:
+      g  = g / sqrtf(A);
+      k  = 1.0f / b->q;
+      m0 = 1.0f; m1 = k * (A - 1.0f); m2 = (A * A - 1.0f);
       break;
-    }
 
-    case PEQ_HIGHSHELF: {
-      const float ap1 = A + 1.0f, am1 = A - 1.0f;
-      const float twoSqrtAalpha = 2.0f * sqrtf(A) * alpha;
-      b0 =        A * (ap1 + am1 * cosw0 + twoSqrtAalpha);
-      b1 = -2.0f * A * (am1 + ap1 * cosw0);
-      b2 =        A * (ap1 + am1 * cosw0 - twoSqrtAalpha);
-      a0 =            (ap1 - am1 * cosw0 + twoSqrtAalpha);
-      a1 =  2.0f *    (am1 - ap1 * cosw0);
-      a2 =            (ap1 - am1 * cosw0 - twoSqrtAalpha);
+    case PEQ_HIGHSHELF:
+      g  = g * sqrtf(A);
+      k  = 1.0f / b->q;
+      m0 = A * A; m1 = k * (1.0f - A) * A; m2 = (1.0f - A * A);
       break;
-    }
 
     case PEQ_LOWPASS:
-      b0 = (1.0f - cosw0) * 0.5f;
-      b1 =  1.0f - cosw0;
-      b2 = (1.0f - cosw0) * 0.5f;
-      a0 =  1.0f + alpha;
-      a1 = -2.0f * cosw0;
-      a2 =  1.0f - alpha;
+      k  = 1.0f / b->q;
+      m0 = 0.0f; m1 = 0.0f; m2 = 1.0f;
       break;
 
     case PEQ_HIGHPASS:
-      b0 =  (1.0f + cosw0) * 0.5f;
-      b1 = -(1.0f + cosw0);
-      b2 =  (1.0f + cosw0) * 0.5f;
-      a0 =   1.0f + alpha;
-      a1 =  -2.0f * cosw0;
-      a2 =   1.0f - alpha;
+      k  = 1.0f / b->q;
+      m0 = 1.0f; m1 = -k; m2 = -1.0f;
       break;
 
     default:
@@ -90,12 +66,13 @@ static void design_band(const peq_band_t *b, float fs, biquad_coeffs_t *c) {
       return;
   }
 
-  const float inv_a0 = 1.0f / a0;
-  c->b0 = b0 * inv_a0;
-  c->b1 = b1 * inv_a0;
-  c->b2 = b2 * inv_a0;
-  c->a1 = a1 * inv_a0;
-  c->a2 = a2 * inv_a0;
+  const float a1 = 1.0f / (1.0f + g * (g + k));
+  c->a1 = a1;
+  c->a2 = g * a1;
+  c->a3 = g * c->a2;
+  c->m0 = m0;
+  c->m1 = m1;
+  c->m2 = m2;
 }
 
 void peq_init(peq_t *p, float fs) {
@@ -114,9 +91,20 @@ void peq_init(peq_t *p, float fs) {
   }
 }
 
+static inline float clampf(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+void peq_clamp_band(peq_band_t *band) {
+  band->fc      = clampf(band->fc,      PEQ_FC_MIN_HZ,   PEQ_FC_MAX_HZ);
+  band->gain_db = clampf(band->gain_db, PEQ_GAIN_MIN_DB, PEQ_GAIN_MAX_DB);
+  band->q       = clampf(band->q,       PEQ_Q_MIN,       PEQ_Q_MAX);
+}
+
 void peq_set_band(peq_t *p, uint8_t idx, const peq_band_t *band) {
   if (idx >= PEQ_MAX_BANDS) return;
   p->band[idx] = *band;
+  peq_clamp_band(&p->band[idx]);
   design_band(&p->band[idx], p->fs, &p->coeffs[idx]);
 }
 
@@ -138,21 +126,22 @@ void peq_reset_state(peq_t *p) {
   memset(p->state, 0, sizeof(p->state));
 }
 
-// One Direct-Form-I biquad step.
-static inline float biquad_step(const biquad_coeffs_t *c, biquad_state_t *s, float x) {
-  const float y = c->b0 * x + c->b1 * s->x1 + c->b2 * s->x2
-                            - c->a1 * s->y1 - c->a2 * s->y2;
-  s->x2 = s->x1; s->x1 = x;
-  s->y2 = s->y1; s->y1 = y;
-  return y;
+// One TPT state-variable filter step (Cytomic).
+static inline float svf_step(const svf_coeffs_t *c, svf_state_t *s, float v0) {
+  const float v3 = v0 - s->ic2eq;
+  const float v1 = c->a1 * s->ic1eq + c->a2 * v3;
+  const float v2 = s->ic2eq + c->a2 * s->ic1eq + c->a3 * v3;
+  s->ic1eq = 2.0f * v1 - s->ic1eq;
+  s->ic2eq = 2.0f * v2 - s->ic2eq;
+  return c->m0 * v0 + c->m1 * v1 + c->m2 * v2;
 }
 
-// Run one channel's whole chain (pre-gain -> enabled biquads -> host volume).
+// Run one channel's whole chain (pre-gain -> enabled bands -> host volume).
 static inline float process_sample(peq_t *p, uint8_t ch, float x) {
   x *= p->pre_gain;
   for (uint8_t i = 0; i < PEQ_MAX_BANDS; i++) {
     if (p->band[i].enabled) {
-      x = biquad_step(&p->coeffs[i], &p->state[ch][i], x);
+      x = svf_step(&p->coeffs[i], &p->state[ch][i], x);
     }
   }
   return x * p->host_gain;
