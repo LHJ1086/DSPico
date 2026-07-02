@@ -37,6 +37,7 @@ add_executable(dspico
     src/status_led.c
     src/dsp_peq.c
     src/signal_path.c
+    src/config_usb.c
 )
 
 # Generate ws2812.pio.h from the PIO source (uses the SDK's pioasm).
@@ -51,6 +52,7 @@ target_link_libraries(dspico
     pico_unique_id
     hardware_pio
     hardware_clocks
+    hardware_flash
     tinyusb_device
     tinyusb_host
     pico_pio_usb

@@ -17,8 +17,19 @@
 enum {
   ITF_NUM_AUDIO_CONTROL = 0,
   ITF_NUM_AUDIO_STREAMING,
+  ITF_NUM_VENDOR,          // WebUSB config channel (class 0xFF), brief §4/§6b
   ITF_NUM_TOTAL
 };
+
+// Vendor (WebUSB) bulk endpoints. The config protocol itself uses control
+// transfers, but the vendor class driver wants a bulk pair; they sit idle.
+#define EPNUM_VENDOR_OUT 0x02
+#define EPNUM_VENDOR_IN  0x82
+
+// Getters for the BOS-referenced descriptors, used by the vendor control
+// handler in config_usb.c.
+const uint8_t *dspico_desc_ms_os_20(uint16_t *len);
+const uint8_t *dspico_desc_webusb_url(uint16_t *len);
 
 // --- Audio entity IDs (unique within the AC interface) ----------------------
 #define UAC2_ENTITY_CLOCK        0x04

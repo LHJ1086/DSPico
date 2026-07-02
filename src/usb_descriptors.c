@@ -61,7 +61,7 @@ uint8_t const *tud_descriptor_device_cb(void) {
   ((AUDIO_CTRL_RW << AUDIO_FEATURE_UNIT_CTRL_MUTE_POS)                  \
    | (AUDIO_CTRL_RW << AUDIO_FEATURE_UNIT_CTRL_VOLUME_POS))
 
-#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + DSPICO_UAC2_DESC_TOTAL_LEN)
+#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + DSPICO_UAC2_DESC_TOTAL_LEN + TUD_VENDOR_DESC_LEN)
 
 static uint8_t const desc_configuration[] = {
     // Configuration header: 1 config, ITF_NUM_TOTAL interfaces, self-checked
@@ -141,6 +141,9 @@ static uint8_t const desc_configuration[] = {
 
     // --- Isochronous feedback IN endpoint -----------------------------------
     TUD_AUDIO_DESC_STD_AS_ISO_FB_EP(/*_ep*/ EPNUM_AUDIO_FB, /*_interval*/ 0x01),
+
+    // --- Vendor interface: the WebUSB EQ config channel (brief §6b) ----------
+    TUD_VENDOR_DESCRIPTOR(ITF_NUM_VENDOR, STRID_VENDOR, EPNUM_VENDOR_OUT, EPNUM_VENDOR_IN, 64),
 };
 
 // Compile-time guard: the hand-declared total length in usb_descriptors.h must
@@ -161,6 +164,7 @@ enum {
   STRID_MANUFACTURER,
   STRID_PRODUCT,
   STRID_SERIAL,
+  STRID_VENDOR,
 };
 
 static char const *string_desc_arr[] = {
@@ -168,6 +172,7 @@ static char const *string_desc_arr[] = {
     "DSPico",                    // 1: Manufacturer
     "DSPico EQ Bridge",          // 2: Product (shown in the OS output list)
     NULL,                        // 3: Serial — filled from chip ID at runtime
+    "DSPico Config",             // 4: Vendor (WebUSB) interface
 };
 
 static uint16_t _desc_str[32 + 1];
@@ -218,4 +223,86 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
   // First 16-bit word: length (bytes, incl. header) and descriptor type.
   _desc_str[0] = (uint16_t)((TUSB_DESC_STRING << 8) | (2 * chr_count + 2));
   return _desc_str;
+}
+
+// ---------------------------------------------------------------------------
+// BOS + WebUSB + MS OS 2.0 descriptors (driverless Chrome access, brief §4/§6b)
+//
+// The BOS advertises two platform capabilities: WebUSB (so Chrome can open the
+// device and learn the landing page) and MS OS 2.0 (so Windows binds WinUSB to
+// the vendor interface with no Zadig). Same pattern as TinyUSB's webusb_serial
+// example. The vendor codes are answered in config_usb.c.
+// ---------------------------------------------------------------------------
+#define VENDOR_REQUEST_WEBUSB    0x21
+#define VENDOR_REQUEST_MICROSOFT 0x22
+
+#define BOS_TOTAL_LEN (TUD_BOS_DESC_LEN + TUD_BOS_WEBUSB_DESC_LEN + TUD_BOS_MICROSOFT_OS_DESC_LEN)
+
+#define MS_OS_20_DESC_LEN 0xB2
+
+static uint8_t const desc_bos[] = {
+    TUD_BOS_DESCRIPTOR(BOS_TOTAL_LEN, 2),
+    // WebUSB: vendor code + landing-page string index (1).
+    TUD_BOS_WEBUSB_DESCRIPTOR(VENDOR_REQUEST_WEBUSB, 1),
+    // MS OS 2.0: descriptor-set length + vendor code.
+    TUD_BOS_MS_OS_20_DESCRIPTOR(MS_OS_20_DESC_LEN, VENDOR_REQUEST_MICROSOFT),
+};
+
+uint8_t const *tud_descriptor_bos_cb(void) {
+  return desc_bos;
+}
+
+// MS OS 2.0 descriptor set: WinUSB compatible ID + DeviceInterfaceGUID for the
+// vendor interface (ITF_NUM_VENDOR).
+static uint8_t const desc_ms_os_20[] = {
+    // Set header: length, type, windows version, total length
+    U16_TO_U8S_LE(0x000A), U16_TO_U8S_LE(MS_OS_20_SET_HEADER_DESCRIPTOR),
+    U32_TO_U8S_LE(0x06030000), U16_TO_U8S_LE(MS_OS_20_DESC_LEN),
+
+    // Configuration subset header: length, type, config index, reserved, total length
+    U16_TO_U8S_LE(0x0008), U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_CONFIGURATION),
+    0, 0, U16_TO_U8S_LE(MS_OS_20_DESC_LEN - 0x0A),
+
+    // Function subset header: length, type, first interface, reserved, subset length
+    U16_TO_U8S_LE(0x0008), U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_FUNCTION),
+    ITF_NUM_VENDOR, 0, U16_TO_U8S_LE(MS_OS_20_DESC_LEN - 0x0A - 0x08),
+
+    // Compatible ID descriptor: length, type, compatible ID ("WINUSB"), sub id
+    U16_TO_U8S_LE(0x0014), U16_TO_U8S_LE(MS_OS_20_FEATURE_COMPATBLE_ID),
+    'W', 'I', 'N', 'U', 'S', 'B', 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    // Registry property descriptor: DeviceInterfaceGUIDs (multi-sz)
+    U16_TO_U8S_LE(MS_OS_20_DESC_LEN - 0x0A - 0x08 - 0x08 - 0x14),
+    U16_TO_U8S_LE(MS_OS_20_FEATURE_REG_PROPERTY),
+    U16_TO_U8S_LE(0x0007), U16_TO_U8S_LE(0x002A), // data type (REG_MULTI_SZ), name length
+    'D', 0x00, 'e', 0x00, 'v', 0x00, 'i', 0x00, 'c', 0x00, 'e', 0x00,
+    'I', 0x00, 'n', 0x00, 't', 0x00, 'e', 0x00, 'r', 0x00, 'f', 0x00,
+    'a', 0x00, 'c', 0x00, 'e', 0x00, 'G', 0x00, 'U', 0x00, 'I', 0x00,
+    'D', 0x00, 's', 0x00, 0x00, 0x00,
+    U16_TO_U8S_LE(0x0050), // property data length
+    '{', 0x00, '9', 0x00, '7', 0x00, '5', 0x00, 'F', 0x00, '4', 0x00,
+    '4', 0x00, 'D', 0x00, '9', 0x00, '-', 0x00, '0', 0x00, 'D', 0x00,
+    '0', 0x00, '8', 0x00, '-', 0x00, '4', 0x00, '3', 0x00, 'F', 0x00,
+    'D', 0x00, '-', 0x00, '8', 0x00, 'B', 0x00, '3', 0x00, 'E', 0x00,
+    '-', 0x00, '1', 0x00, '2', 0x00, '7', 0x00, 'C', 0x00, 'A', 0x00,
+    '8', 0x00, 'A', 0x00, 'F', 0x00, 'F', 0x00, 'F', 0x00, '9', 0x00,
+    'D', 0x00, '}', 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+TU_VERIFY_STATIC(sizeof(desc_ms_os_20) == MS_OS_20_DESC_LEN, "MS OS 2.0 length mismatch");
+
+// WebUSB URL descriptor (landing page shown by Chrome). Host your copy of the
+// config page and point this at it; https scheme code = 1.
+static const uint8_t desc_url[] = {
+    3 + 17, 3, 1,  // bLength, bDescriptorType (URL), bScheme (1 = https)
+    'l','h','j','1','0','8','6','.','g','i','t','h','u','b','.','i','o',
+};
+
+const uint8_t *dspico_desc_ms_os_20(uint16_t *len) {
+  if (len) *len = sizeof(desc_ms_os_20);
+  return desc_ms_os_20;
+}
+const uint8_t *dspico_desc_webusb_url(uint16_t *len) {
+  if (len) *len = sizeof(desc_url);
+  return desc_url;
 }

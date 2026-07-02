@@ -64,7 +64,11 @@ extern "C" {
 #define CFG_TUD_MSC     0
 #define CFG_TUD_HID     0
 #define CFG_TUD_MIDI    0
-#define CFG_TUD_VENDOR  0
+#define CFG_TUD_VENDOR  1        // WebUSB EQ config channel (brief §6b)
+
+// Vendor bulk FIFOs — the config protocol is control-only, so keep them small.
+#define CFG_TUD_VENDOR_RX_BUFSIZE 64
+#define CFG_TUD_VENDOR_TX_BUFSIZE 64
 
 // --- UAC2 speaker (OUT only) parameters ------------------------------------
 // One Audio Streaming interface (the OUT/speaker path). No capture (brief §1).

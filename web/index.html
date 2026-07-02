@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<!--
+  DSPico — WebUSB parametric-EQ configurator (brief §6b).
+
+  A single static page. Works two ways:
+    * Standalone: design an EQ, import an AutoEQ preset, see the response curve,
+      save/load JSON — no hardware needed.
+    * Connected: click "Connect" to open the DSPico vendor interface over WebUSB
+      and push bands / pre-gain live, load the device's current state, and
+      commit it to on-board flash.
+
+  WebUSB needs Chrome / Edge / Chromium (not Firefox / Safari) and a secure
+  context: serve over https:// or http://localhost (e.g. `python3 -m http.server`
+  then open http://localhost:8000/).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DSPico EQ Configurator</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#171c22; --panel2:#1e242c; --line:#2b333d;
+    --ink:#e7ecf2; --muted:#93a1b0; --accent:#4ea1ff; --accent2:#7ee0a1;
+    --warn:#ffb454; --err:#ff6b6b; --grid:#232b34;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:14px;padding:12px 18px;
+    background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+  header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
+  header .status{margin-left:auto;display:flex;align-items:center;gap:10px}
+  .dot{width:9px;height:9px;border-radius:50%;background:#555}
+  .dot.on{background:var(--accent2);box-shadow:0 0 8px var(--accent2)}
+  button{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+    border-radius:7px;padding:7px 12px;cursor:pointer;font-size:13px}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#05121f;font-weight:650}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  main{padding:16px 18px;max-width:1100px;margin:0 auto;display:grid;gap:16px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .panel h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  canvas{width:100%;height:320px;display:block;background:var(--panel2);border-radius:8px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:6px 8px;text-align:left;border-bottom:1px solid var(--grid)}
+  th{color:var(--muted);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  td input[type=number]{width:88px}
+  input,select{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+    border-radius:6px;padding:5px 7px;font-size:13px}
+  input:focus,select:focus{outline:none;border-color:var(--accent)}
+  .num{width:96px}
+  .muted{color:var(--muted)}
+  .pill{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--panel2);border:1px solid var(--line)}
+  #log{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--muted);
+    white-space:pre-wrap;max-height:120px;overflow:auto;margin:0}
+  .grip{display:flex;gap:8px;flex-wrap:wrap}
+  label.field{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--muted)}
+  .warnbox{color:var(--warn)} .errbox{color:var(--err)}
+  a{color:var(--accent)}
+  textarea{width:100%;min-height:90px;background:var(--panel2);color:var(--ink);
+    border:1px solid var(--line);border-radius:6px;padding:8px;font-family:ui-monospace,monospace;font-size:12px}
+  .cluster{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+</style>
+</head>
+<body>
+<header>
+  <h1>DSPico&nbsp;<span class="muted">EQ Configurator</span></h1>
+  <div class="cluster">
+    <button id="btnConnect" class="primary">Connect device</button>
+    <button id="btnLoadDev" disabled>Load from device</button>
+    <button id="btnPushDev" disabled>Push to device</button>
+    <button id="btnCommit"  disabled>Save to flash</button>
+  </div>
+  <div class="status">
+    <span class="dot" id="dot"></span>
+    <span id="devinfo" class="pill">not connected</span>
+  </div>
+</header>
+
+<main>
+  <div class="panel">
+    <h2>Frequency response</h2>
+    <canvas id="graph" width="1060" height="320"></canvas>
+    <div class="row muted" style="margin-top:8px">
+      <span>Auto (browser) preview of the summed response — matches the device's per-band design.</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Global</h2>
+    <div class="row">
+      <label class="field">Pre-gain (dB)
+        <input class="num" id="preGain" type="number" step="0.1" value="0">
+      </label>
+      <button id="btnAuto">Auto headroom</button>
+      <span class="muted" id="autoHint"></span>
+      <span style="margin-left:auto"></span>
+      <button id="btnAddBand">+ Add band</button>
+      <span class="muted" id="bandCount"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Bands</h2>
+    <table id="bands">
+      <thead><tr>
+        <th>On</th><th>Type</th><th>Fc (Hz)</th><th>Gain (dB)</th><th>Q</th><th></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>Import / Export</h2>
+    <div class="grip">
+      <label class="field">AutoEQ preset file (ParametricEQ.txt)
+        <input type="file" id="fileAutoEq" accept=".txt,text/plain">
+      </label>
+      <label class="field">DSPico JSON preset
+        <input type="file" id="fileJson" accept=".json,application/json">
+      </label>
+      <div class="cluster" style="align-self:flex-end">
+        <button id="btnExport">Export JSON</button>
+      </div>
+    </div>
+    <p class="muted" style="margin:10px 0 4px">…or paste an AutoEQ preset here:</p>
+    <textarea id="autoEqText" placeholder="Preamp: -6.5 dB&#10;Filter 1: ON PK Fc 105 Hz Gain 5.5 dB Q 0.70&#10;Filter 2: ON LSC Fc 105 Hz Gain 5.5 dB Q 0.70"></textarea>
+    <div class="row" style="margin-top:8px">
+      <button id="btnParsePaste" class="primary">Import pasted AutoEQ</button>
+      <span id="importMsg" class="muted"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </div>
+</main>
+
+<script src="dspico.js"></script>
+</body>
+</html>

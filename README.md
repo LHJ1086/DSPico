@@ -29,8 +29,8 @@ is pure on-core DSP and runs regardless.
 | **UAC2 output** — 48 kHz/24-bit stereo, no capture, Volume + Mute Feature Unit | ✅ implemented | `src/usb_descriptors.*`, `src/uac2_device.c` |
 | **On-device parametric EQ** — N-band stereo SVF, 1 Hz–20 kHz, ±12 dB, Q 0.1–10, pre-gain, host-volume | ✅ implemented + **unit-tested** | `src/dsp_peq.*` |
 | **Signal path** — PC audio → pre-gain → PEQ → host volume → cross-core ring → DAC | ✅ implemented + **unit-tested** | `src/signal_path.*`, `src/audio_ring.h` |
+| **WebUSB configurator** — browser app + device vendor protocol, AutoEQ import, flash-persisted presets | ✅ implemented (app **unit-tested**) | `web/`, `src/config_usb.c` |
 | PIO **host** streams iso OUT to a DAC (test tone when idle) | ⚠️ **needs the hardware gate** | `src/uac_host.c`, `src/test_tone.c` |
-| WebUSB configurator (edit bands from a browser) | ⛔ not yet (Phase 3) | — |
 | Clock-domain feedback tuning; hot-plug/suspend robustness | ⛔ not yet (Phase 4/5) | — |
 
 > Honesty note: the **DSP and signal-path code is verified** — compiled with the
@@ -291,13 +291,17 @@ src/
   usb_descriptors.[ch]   UAC2 speaker descriptors (Feature Unit, feedback EP)
   uac2_device.c          device audio callbacks: vol/mute, RX->signal path
   uac_host.[ch]          custom UAC *host* driver over Pico-PIO-USB (Phase 1b)
-  dsp_peq.[ch]           on-device parametric EQ engine (RBJ biquads)  <<<
+  dsp_peq.[ch]           on-device parametric EQ engine (state-variable)  <<<
   signal_path.[ch]       pre-gain -> PEQ -> host volume -> play ring    <<<
   audio_ring.h           lock-free cross-core SPSC audio ring
+  config_usb.[ch]        WebUSB vendor protocol + flash-persisted presets <<<
   test_tone.[ch]         48 kHz / 24-bit sine generator (idle/gate fallback)
   status_led.[ch]        WS2812 state indicator (on PIO2, no conflict)
   ws2812.pio             LED PIO program (assembled at build time)
   main.c                 clock, dual-core split, both stacks, EQ wiring
+web/
+  index.html             the configurator page
+  dspico.js              UI, AutoEQ import, response curve, WebUSB protocol
 ```
 
 ---
@@ -367,15 +371,42 @@ with a runner.)
 
 ---
 
-## Next steps (after the gate passes)
+## Browser configurator (`web/`)
 
-The DSP is done. What remains is gated on Phase 1b:
+A single static page (`web/index.html` + `web/dspico.js`) that edits the EQ from
+Chrome / Edge / Chromium. It works **standalone** (design a curve, import an
+AutoEQ preset, see the response, save/load JSON) and **connected** (push bands +
+pre-gain live over WebUSB, load the device's state, commit to flash).
+
+**Serve it** (WebUSB needs https or localhost):
+
+```bash
+cd web && python3 -m http.server 8000
+# open http://localhost:8000/ in Chrome/Edge, click "Connect device"
+```
+
+**AutoEQ compatibility.** Import a downloaded AutoEQ `ParametricEQ.txt` (file or
+paste). It maps `Preamp` → pre-gain and the filter types **PK → peaking,
+LSC/LS → low shelf, HSC/HS → high shelf, LP/LPQ → low pass, HP/HPQ → high pass**;
+`ON`/`OFF` is honored; values outside DSPico's ranges (Fc 1 Hz–20 kHz, gain
+±12 dB, Q 0.1–10) are clamped with a note, presets longer than the band count are
+truncated with a note, and unsupported filter types (notch/allpass/bandpass) are
+skipped with a note. The device uses the same band count it reports over USB.
+
+**Device protocol.** Vendor control transfers on interface `ITF_NUM_VENDOR`
+(`src/config_usb.c`), kept in sync with `web/dspico.js`: `INFO`, `GET_STATE`,
+`SET_PREGAIN`, `SET_BAND`, `COMMIT` (persist to the last flash sector — core1 is
+frozen during the write), `RESET`. Driverless access uses a WebUSB BOS + MS OS
+2.0 (WinUSB) descriptor. Update the landing-page URL in `usb_descriptors.c`
+(`desc_url`) to wherever you host the page.
+
+The app's pure logic (AutoEQ parser, clamping, response curve) is unit-tested
+with Node; the device half compiles with the rest of the USB stack.
+
+## Next steps (after the gate passes)
 
 - **Phase 4 — clock sync:** the capture (PC) and play (DAC) rates differ slightly;
   the async feedback endpoint already slaves the PC to us, but tune it against
   the real DAC FIFO level so the ring neither starves nor overflows over hours.
-- **Phase 3 — WebUSB configurator:** a static HTML/JS page that edits bands +
-  pre-gain live over the vendor interface (needs a small vendor endpoint added to
-  the device descriptors). This can be built now against a stubbed protocol.
-- **Phase 5 — robustness:** DAC hot-plug, PC suspend/resume, flash-persisted
-  presets, richer LED states.
+- **Phase 5 — robustness:** DAC hot-plug, PC suspend/resume, richer LED states,
+  multiple stored presets.

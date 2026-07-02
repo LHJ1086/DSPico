@@ -24,6 +24,7 @@
 #include "uac_host.h"
 #include "test_tone.h"
 #include "signal_path.h"
+#include "config_usb.h"
 
 // The audio the host streams to the DAC: EQ'd PC audio from the play ring when
 // the PC is streaming, otherwise the firmware test tone (keeps the DAC fed and
@@ -54,6 +55,9 @@ static void core1_main(void) {
   tuh_configure(DSPICO_RHPORT_HOST, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
   tuh_init(DSPICO_RHPORT_HOST);
 
+  // Allow core0 to briefly freeze this core during flash writes (config commit).
+  multicore_lockout_victim_init();
+
   for (;;) {
     tuh_task();
   }
@@ -73,8 +77,9 @@ int main(void) {
   printf("\nDSPico — Phase 0/1 firmware, sysclk=%lu kHz\n", (unsigned long) DSPICO_SYS_CLK_KHZ);
 
   // On-device signal path (PEQ engine + play ring). Flat by default; the UAC2
-  // volume callback and the future WebUSB handler configure it live.
+  // volume callback and the WebUSB config handler configure it live.
   signal_path_init();
+  config_usb_init();          // restore any flash-persisted EQ preset
 
   // Example: hard-code an EQ preset until the WebUSB configurator lands. This is
   // the brief's acceptance-test filter (a -6 dB dip @ 1 kHz with -6 dB pre-gain).
