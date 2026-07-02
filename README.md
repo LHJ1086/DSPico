@@ -73,30 +73,184 @@ not a solder fix, and is identical for both the -C and -CM variants.
 
 ---
 
-## Build
+## Requirements
 
-Prerequisites: `arm-none-eabi-gcc`, `cmake` (≥3.13), and the **Pico SDK**
-(export `PICO_SDK_PATH`, or use `-DPICO_SDK_FETCH_FROM_GIT=ON`).
+| Tool | Minimum version | Purpose |
+|------|-----------------|---------|
+| **ARM GNU toolchain** (`arm-none-eabi-gcc`) | 10 (13.x tested) | cross-compiler for the Cortex-M33 |
+| **CMake** | 3.13 | build generator |
+| **Make** or **Ninja** | any | build backend |
+| **Git** | any | fetch the SDK + Pico-PIO-USB |
+| **Python** | 3.x | SDK helper scripts + `picotool` build |
+| **Pico SDK** | **2.0.0** (2.1.1 recommended) | RP2350 support (bundles TinyUSB) |
+| **Pico-PIO-USB** | `master` | the second (host) USB port — fetched by `setup.sh` |
+| `libusb-1.0` dev headers | any | needed to build `picotool` (which the SDK builds) |
+
+> RP2350 support only exists in Pico SDK **≥ 2.0.0** — an older SDK will fail.
+> We build the ARM (Cortex-M33) core, so only the **`arm-none-eabi`** toolchain
+> is needed (no RISC-V toolchain required).
+
+---
+
+## Step 1 — Install the toolchain (pick your OS)
+
+### Debian / Ubuntu
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+    cmake git python3 build-essential ninja-build \
+    gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib \
+    libusb-1.0-0-dev
+```
+> `libnewlib-arm-none-eabi` and `libstdc++-arm-none-eabi-newlib` are easy to
+> forget and cause `cannot find -lc` / missing-header errors without them.
+
+### Fedora / RHEL
+```bash
+sudo dnf install -y \
+    cmake git python3 ninja-build \
+    arm-none-eabi-gcc-cs arm-none-eabi-newlib libusbx-devel
+```
+
+### Arch / Manjaro
+```bash
+sudo pacman -S --needed \
+    cmake git python ninja \
+    arm-none-eabi-gcc arm-none-eabi-newlib arm-none-eabi-binutils libusb
+```
+
+### macOS (Homebrew)
+```bash
+brew install cmake git python ninja libusb
+brew install --cask gcc-arm-embedded        # provides arm-none-eabi-gcc
+# (alternative: brew install arm-none-eabi-gcc)
+```
+
+### Windows
+Two good options:
+- **Easiest:** the official **[Pico setup for Windows](https://github.com/raspberrypi/pico-setup-windows)**
+  installer — it bundles the ARM toolchain, CMake, Ninja, Python, and the SDK,
+  and gives you a preconfigured "Pico Developer Command Prompt". After it runs,
+  skip Step 2 (it installs the SDK for you) and continue at Step 3.
+- **Recommended for this project:** **WSL2** (Ubuntu) and then follow the
+  Debian/Ubuntu instructions above — the flashing/serial notes below assume a
+  Unix-like shell.
+
+### Verify
+```bash
+arm-none-eabi-gcc --version   # expect 10.x–13.x
+cmake --version               # expect >= 3.13
+```
+
+---
+
+## Step 2 — Install the Pico SDK
+
+You need the SDK on disk and the `PICO_SDK_PATH` environment variable pointing at
+it. Clone it **with submodules** (this is what pulls in TinyUSB):
 
 ```bash
-./setup.sh                                   # clones lib/Pico-PIO-USB
-export PICO_SDK_PATH=/path/to/pico-sdk       # if not already set
-cmake -B build -DPICO_BOARD=pico2
+git clone -b 2.1.1 https://github.com/raspberrypi/pico-sdk.git --recurse-submodules ~/pico-sdk
+export PICO_SDK_PATH=~/pico-sdk
+# make it permanent:
+echo 'export PICO_SDK_PATH=~/pico-sdk' >> ~/.bashrc     # or ~/.zshrc on macOS
+```
+
+> **Alternative (no manual clone):** skip this step and add
+> `-DPICO_SDK_FETCH_FROM_GIT=ON` to the CMake command in Step 4 — CMake will
+> download the SDK for you. The explicit clone above is faster for repeat builds.
+
+---
+
+## Step 3 — Fetch this project's extra dependency
+
+From the repository root:
+
+```bash
+./setup.sh
+```
+
+This clones **Pico-PIO-USB** into `lib/Pico-PIO-USB` (the only vendored
+dependency; the SDK provides everything else). Re-running it is safe. If you
+prefer to do it by hand:
+
+```bash
+git clone --depth 1 https://github.com/sekigon-gonnoc/Pico-PIO-USB lib/Pico-PIO-USB
+```
+
+---
+
+## Step 4 — Build
+
+```bash
+cmake -B build -DPICO_BOARD=pico2          # add -G Ninja if you installed Ninja
 cmake --build build -j
-# -> build/dspico.uf2
+# -> build/dspico.uf2   (plus dspico.elf / .bin / .map)
 ```
 
-## Flash
+The first configure builds `picotool` and generates `ws2812.pio.h` from the PIO
+source — both automatic. A clean rebuild is `rm -rf build` then re-run the two
+commands.
 
-Hold **BOOTSEL**, tap **RUN/reset**, release BOOTSEL → the board mounts as
-`RP2350` mass storage. Copy the UF2:
+---
+
+## Step 5 — Flash
+
+**BOOTSEL drag-and-drop (simplest):** hold **BOOTSEL**, tap **RUN/reset**,
+release BOOTSEL → the board mounts as a `RP2350` USB drive. Copy the UF2:
 
 ```bash
-cp build/dspico.uf2 /path/to/RP2350/
+# Linux (path varies by distro/user):
+cp build/dspico.uf2 /media/$USER/RP2350/
+# macOS:
+cp build/dspico.uf2 /Volumes/RP2350/
+# Windows: drag build\dspico.uf2 onto the RP2350 drive in Explorer
 ```
 
-Debug prints come out on **UART0 (GPIO0 TX / GPIO1 RX, 115200 baud)** — USB is
-reserved for the audio path.
+The board reboots into the firmware automatically after the copy.
+
+**picotool (no button dance on reflash):**
+```bash
+picotool load build/dspico.uf2 && picotool reboot
+```
+On Linux, `picotool` needs USB permissions — either run with `sudo` or install
+udev rules (the `pico-sdk/src/rp2_common/../picotool` repo ships
+`99-picotool.rules`).
+
+---
+
+## Step 6 — View debug output (UART)
+
+`printf` output goes to **UART0: GPIO0 = TX, GPIO1 = RX, 115200 8N1** — **not**
+USB (both USB ports are the audio path). You need a **3.3 V USB-to-UART adapter**
+wired GND↔GND, adapter-RX ↔ board-GPIO0.
+
+```bash
+# Linux (adapter usually enumerates as /dev/ttyUSB0):
+sudo screen /dev/ttyUSB0 115200        # or: minicom -D /dev/ttyUSB0 -b 115200
+# macOS:
+screen /dev/tty.usbserial-XXXX 115200
+# Windows: use PuTTY -> Serial -> COMx @ 115200
+```
+(Quit `screen` with `Ctrl-A` then `k`.)
+
+---
+
+## Troubleshooting
+
+- **`PICO_SDK_PATH ... not found` / "SDK location was not specified"** — export
+  `PICO_SDK_PATH` (Step 2) or configure with `-DPICO_SDK_FETCH_FROM_GIT=ON`.
+- **`Pico-PIO-USB not found at lib/Pico-PIO-USB`** — run `./setup.sh` (Step 3).
+- **`cannot find -lc` / `stdio.h: No such file`** — missing newlib; install
+  `libnewlib-arm-none-eabi` (Debian) / `arm-none-eabi-newlib` (Fedora/Arch).
+- **CMake picks the wrong chip** — always pass `-DPICO_BOARD=pico2` (RP2350).
+- **`picotool` build fails on `libusb.h`** — install `libusb-1.0-0-dev`
+  (or `libusbx-devel` / `libusb`).
+- **Board never appears as `RP2350` drive** — you didn't enter BOOTSEL: hold
+  BOOTSEL *before* tapping reset, keep holding a moment after.
+- **TinyUSB audio-macro compile errors** — you're likely on a different SDK than
+  2.1.1; the UAC2 descriptor macro names are version-sensitive (see the status
+  note at the top). Report the error and it can be adjusted.
 
 ---
 
