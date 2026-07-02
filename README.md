@@ -302,6 +302,11 @@ src/
 web/
   index.html             the configurator page
   dspico.js              UI, AutoEQ import, response curve, WebUSB protocol
+tests/
+  peq_test.c             native tests for the EQ engine
+  path_test.c            native tests for the signal path + cross-core ring
+  web_test.js            Node tests for the configurator's pure logic
+  run.sh                 builds + runs every host-side suite
 ```
 
 ---
@@ -351,23 +356,30 @@ A commented copy of exactly this (the brief's acceptance-test filter) sits in
 
 ### Verifying the DSP (no hardware needed)
 
-The EQ and signal-path modules are plain C and were validated with the native
-compiler. To reproduce:
+The EQ and signal-path modules are plain C and are validated with the native
+compiler. The test drivers live in [`tests/`](tests/) and run in CI on every
+push (see `.github/workflows/ci.yml`). To reproduce locally:
+
+```bash
+tests/run.sh          # builds + runs every host-side suite (needs gcc, node)
+```
+
+or individually:
 
 ```bash
 # frequency response of designed filters (peaking/shelf/pre-gain/multi-band):
-gcc -O2 -Wall -o peq_test  peq_test.c  src/dsp_peq.c -lm && ./peq_test
+gcc -O2 -Wall -Wextra -I src -o peq_test tests/peq_test.c src/dsp_peq.c -lm && ./peq_test
 # capture -> EQ -> ring -> play, incl. odd chunk sizes + wraparound:
-gcc -O2 -Wall -o path_test path_test.c src/signal_path.c src/dsp_peq.c -lm && ./path_test
+gcc -O2 -Wall -Wextra -I src -o path_test tests/path_test.c src/signal_path.c src/dsp_peq.c -lm && ./path_test
 ```
 
 Measured results: peaking/shelf gains land within ~0.15 dB of target at Fc and
 are flat elsewhere; **the full range is exact — a +6 dB band reads +6.00 dB at
 1 Hz and at 20 kHz, and ±12 dB holds across Q 0.1–10**; out-of-range params clamp
-correctly; pre-gain scales exactly; a flat EQ is bit-transparent; and 640k frames
-survive ring wraparound with zero ordering errors. (Test drivers live under the
-repo's development notes — ask if you want them committed to a `tests/` folder
-with a runner.)
+correctly; pre-gain scales exactly; a flat EQ is bit-transparent (within 1 LSB
+on the packed 24-bit path); and 640k frames survive ring wraparound with zero
+ordering errors. See [`tests/README.md`](tests/README.md) for the full coverage
+map.
 
 ---
 
@@ -405,7 +417,8 @@ frozen during the write), `RESET`. Driverless access uses a WebUSB BOS + MS OS
 (`desc_url`) to wherever you host the page.
 
 The app's pure logic (AutoEQ parser, clamping, response curve) is unit-tested
-with Node; the device half compiles with the rest of the USB stack.
+with Node in [`tests/web_test.js`](tests/web_test.js) (run via `tests/run.sh`);
+the device half compiles with the rest of the USB stack.
 
 ## Next steps (after the gate passes)
 
@@ -414,3 +427,9 @@ with Node; the device half compiles with the rest of the USB stack.
   the real DAC FIFO level so the ring neither starves nor overflows over hours.
 - **Phase 5 — robustness:** DAC hot-plug, PC suspend/resume, richer LED states,
   multiple stored presets.
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).
