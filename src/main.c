@@ -10,6 +10,7 @@
 // hardware go/no-go gate before wiring the two together (Phase 2).
 // ---------------------------------------------------------------------------
 #include <stdio.h>
+#include <string.h>
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
@@ -28,11 +29,17 @@
 
 // The audio the host streams to the DAC: EQ'd PC audio from the play ring when
 // the PC is streaming, otherwise the firmware test tone (keeps the DAC fed and
-// lets the Phase 1b gate run with no PC attached).
+// lets the Phase 1b gate run with no PC attached). While the PC *is* streaming
+// but the ring is priming or momentarily underrun, fill with silence — a gap
+// must not blast the test tone into the music.
 static size_t audio_source(uint8_t *dst, size_t max_frames) {
   size_t frames = signal_path_pull_play(dst, max_frames);
   if (frames == 0) {
-    test_tone_fill(dst, max_frames);
+    if (uac2_is_streaming()) {
+      memset(dst, 0, max_frames * DSPICO_NUM_CHANNELS * DSPICO_BYTES_PER_SAMPLE);
+    } else {
+      test_tone_fill(dst, max_frames);
+    }
     frames = max_frames;
   }
   return frames;

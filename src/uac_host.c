@@ -5,6 +5,7 @@
 // the big caveat: isochronous OUT over the bit-banged PIO port is unproven, so
 // treat this as the scaffold you iterate on with a logic analyzer.
 // ---------------------------------------------------------------------------
+#include <stdio.h>
 #include <string.h>
 
 #include "tusb.h"
@@ -31,6 +32,9 @@ typedef struct {
   uint8_t  as_alt;          // operational alt setting (has the iso EP)
   bool     have_as;
 
+  uint8_t  subslot;         // wire bytes/sample: 3 = native 24-bit, 2 = 16-bit fallback
+  uint8_t  bits;            // valid bits/sample of the chosen alt (for diagnostics)
+
   tusb_desc_endpoint_t ep_out;   // the isochronous OUT endpoint descriptor
   bool     have_ep;
 
@@ -51,31 +55,85 @@ bool uac_host_is_streaming(void) { return s_dac.in_use && s_dac.streaming; }
 // ---------------------------------------------------------------------------
 static uint8_t const *desc_next(uint8_t const *p) { return p + p[0]; }
 
+// Format facts collected for one AS alternate setting while walking its
+// descriptors; judged when we reach the alt's isochronous OUT data endpoint.
+typedef struct {
+  uint8_t itf, alt;
+  uint8_t channels;    // 0 until seen
+  uint8_t subslot;     // wire bytes per sample, 0 until seen
+  uint8_t bits;        // valid bits per sample
+  bool    pcm;         // format is Type I PCM
+  bool    rate_ok;     // 48 kHz supported (assumed true unless a UAC1 list says no)
+  bool    in_as_itf;   // currently inside an AS interface's descriptors
+} alt_cand_t;
+
+// Accept an alt setting if it can take our stream: stereo Type-I PCM at 48 kHz
+// in a 3-byte (native 24-bit) or 2-byte (16-bit fallback) subslot. Prefer a
+// 24-bit alt over a 16-bit one; within the same width keep the first found.
+static void consider_candidate(dac_dev_t *d, const alt_cand_t *c,
+                               tusb_desc_endpoint_t const *ep) {
+  if (!c->pcm || !c->rate_ok) return;
+  if (c->channels != DSPICO_NUM_CHANNELS) return;
+  if (c->subslot != 3 && c->subslot != 2) return;
+  if (ep->wMaxPacketSize < DSPICO_NUM_CHANNELS * c->subslot) return;
+  if (d->have_ep && d->subslot >= c->subslot) return;   // existing pick is >= tier
+
+  d->as_itf  = c->itf;
+  d->as_alt  = c->alt;
+  d->subslot = c->subslot;
+  d->bits    = c->bits;
+  memcpy(&d->ep_out, ep, sizeof(*ep));
+  d->have_ep = d->have_as = true;
+}
+
+// UAC1 Type I format descriptor carries the supported sample rates; check that
+// 48 kHz is among them (discrete list) or inside them (continuous range).
+// Reads stay within the descriptor's own bLength.
+static bool uac1_rate_list_has_48k(uint8_t const *p, uint8_t dlen) {
+  const uint8_t n = p[7];   // bSamFreqType: 0 = continuous min..max, else count
+  if (n == 0) {
+    if (dlen < 14) return false;
+    const uint32_t lo = (uint32_t) (p[8]  | (p[9]  << 8) | (p[10] << 16));
+    const uint32_t hi = (uint32_t) (p[11] | (p[12] << 8) | (p[13] << 16));
+    return lo <= DSPICO_SAMPLE_RATE_HZ && DSPICO_SAMPLE_RATE_HZ <= hi;
+  }
+  for (uint8_t i = 0; i < n && (uint16_t) (8 + 3 * i + 3) <= dlen; i++) {
+    const uint8_t *f = p + 8 + 3 * i;
+    if ((uint32_t) (f[0] | (f[1] << 8) | (f[2] << 16)) == DSPICO_SAMPLE_RATE_HZ)
+      return true;
+  }
+  return false;
+}
+
 // Single-pass parse of the whole audio-function descriptor block. With an IAD
 // (typical UAC2) TinyUSB hands us the entire function at once; without one
 // (typical UAC1) it hands us one interface at a time — walking `len` bytes and
 // tracking the current interface context handles both.
 //
-// Records: the AC interface number, UAC version, a UAC2 clock-source id, the AS
-// interface number, and the first alt setting carrying an isochronous OUT data
-// endpoint (plus a copy of that endpoint descriptor).
+// Records: the AC interface number, UAC version, a UAC2 clock-source id, and —
+// via consider_candidate() — the best alt setting whose Type-I PCM format we
+// can actually feed (stereo 48 kHz, 24-bit preferred, 16-bit fallback).
 static void parse_audio_function(dac_dev_t *d, uint8_t const *p, uint16_t len) {
   uint8_t const *end = p + len;
-  uint8_t cur_sub = 0xFF;   // current interface subclass
-  uint8_t cur_alt = 0;      // current alternate setting
+  uint8_t cur_sub = 0xFF;                 // current interface subclass
+  alt_cand_t cand = { .in_as_itf = false };
 
   while (p + 2 <= end && p[0] >= 2 && p + p[0] <= end) {
     const uint8_t dtype = p[1];
+    const uint8_t dlen  = p[0];
 
     if (dtype == TUSB_DESC_INTERFACE) {
       tusb_desc_interface_t const *itf = (tusb_desc_interface_t const *) p;
+      cand.in_as_itf = false;
       if (itf->bInterfaceClass == TUSB_CLASS_AUDIO) {
         cur_sub = itf->bInterfaceSubClass;
-        cur_alt = itf->bAlternateSetting;
         if (cur_sub == AUDIO_SUBCLASS_CONTROL) {
           d->ac_itf = itf->bInterfaceNumber;
-        } else if (cur_sub == AUDIO_SUBCLASS_STREAMING && !d->have_as) {
-          d->as_itf = itf->bInterfaceNumber;
+        } else if (cur_sub == AUDIO_SUBCLASS_STREAMING) {
+          cand = (alt_cand_t) {
+            .itf = itf->bInterfaceNumber, .alt = itf->bAlternateSetting,
+            .rate_ok = true, .in_as_itf = true,
+          };
         }
       } else {
         cur_sub = 0xFF;   // some non-audio interface inside the block
@@ -87,16 +145,34 @@ static void parse_audio_function(dac_dev_t *d, uint8_t const *p, uint16_t len) {
       } else if (subtype == AUDIO_CS_AC_INTERFACE_CLOCK_SOURCE) {
         d->clock_id = p[3];                            // bClockID
       }
-    } else if (dtype == TUSB_DESC_ENDPOINT && cur_sub == AUDIO_SUBCLASS_STREAMING) {
+    } else if (dtype == TUSB_DESC_CS_INTERFACE && cand.in_as_itf) {
+      const uint8_t subtype = p[2];
+      const bool uac2 = d->audio_bcd >= 0x0200;
+      if (subtype == AUDIO_CS_AS_INTERFACE_AS_GENERAL) {
+        if (uac2 && dlen >= 16) {
+          cand.pcm      = (p[6] & 0x01) != 0;   // bmFormats bit 0 = Type I PCM
+          cand.channels = p[10];                // bNrChannels
+        } else if (!uac2 && dlen >= 7) {
+          cand.pcm = (uint16_t) (p[5] | (p[6] << 8)) == 0x0001;   // wFormatTag PCM
+        }
+      } else if (subtype == AUDIO_CS_AS_INTERFACE_FORMAT_TYPE && p[3] == 1 /*Type I*/) {
+        if (uac2 && dlen >= 6) {
+          cand.subslot = p[4];                  // bSubslotSize
+          cand.bits    = p[5];                  // bBitResolution
+        } else if (!uac2 && dlen >= 8) {
+          cand.channels = p[4];                 // bNrChannels
+          cand.subslot  = p[5];                 // bSubframeSize
+          cand.bits     = p[6];                 // bBitResolution
+          cand.rate_ok  = uac1_rate_list_has_48k(p, dlen);
+        }
+      }
+    } else if (dtype == TUSB_DESC_ENDPOINT && cand.in_as_itf) {
       tusb_desc_endpoint_t const *ep = (tusb_desc_endpoint_t const *) p;
       const bool is_iso  = (ep->bmAttributes.xfer == TUSB_XFER_ISOCHRONOUS);
       const bool is_out  = (tu_edpt_dir(ep->bEndpointAddress) == TUSB_DIR_OUT);
       const bool is_data = (ep->bmAttributes.usage == 0x00);   // not feedback
-      if (is_iso && is_out && is_data && !d->have_ep) {
-        d->as_alt = cur_alt;
-        memcpy(&d->ep_out, ep, sizeof(tusb_desc_endpoint_t));
-        d->have_ep = true;
-        d->have_as = true;
+      if (is_iso && is_out && is_data) {
+        consider_candidate(d, &cand, ep);
       }
     }
     p = desc_next(p);
@@ -211,9 +287,17 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
   // We only drive the streaming interface; report the control interface as
   // immediately configured.
   if (!s_dac.have_as || itf_num != s_dac.as_itf) {
+    if (!s_dac.have_as && itf_num == s_dac.ac_itf) {
+      printf("DSPico host: DAC has no stereo 48 kHz Type-I PCM alt (16/24-bit) — not streaming\n");
+    }
     usbh_driver_set_config_complete(dev_addr, itf_num);
     return true;
   }
+
+  printf("DSPico host: DAC itf %u alt %u — %u-bit in %u-byte subslot, EP 0x%02X maxpkt %u%s\n",
+         s_dac.as_itf, s_dac.as_alt, s_dac.bits, s_dac.subslot,
+         s_dac.ep_out.bEndpointAddress, s_dac.ep_out.wMaxPacketSize,
+         s_dac.subslot == 2 ? " (16-bit fallback, truncating)" : "");
 
   // Kick the setup chain: set alt -> set sample rate -> open EP + stream.
   send_set_interface();
@@ -246,11 +330,14 @@ static void on_set_freq_complete(tuh_xfer_t *xfer) {
 
 // --- Isochronous streaming loop --------------------------------------------
 static uint16_t build_packet(void) {
+  const uint8_t  wire_bps = s_dac.subslot;                       // 3 or 2
+  const uint16_t wire_bpf = DSPICO_NUM_CHANNELS * wire_bps;      // bytes/frame on the wire
+
   size_t frames = DSPICO_SAMPLES_PER_MS;
-  const size_t max_frames = s_dac.ep_out.wMaxPacketSize /
-                            (DSPICO_NUM_CHANNELS * DSPICO_BYTES_PER_SAMPLE);
+  const size_t max_frames = s_dac.ep_out.wMaxPacketSize / wire_bpf;
   if (frames > max_frames) frames = max_frames;
 
+  // The source always produces the native 24-bit/3-byte format (6 B/frame).
   size_t got = 0;
   if (s_fill_cb) got = s_fill_cb(s_pkt, frames);
   if (got == 0) {
@@ -258,7 +345,17 @@ static uint16_t build_packet(void) {
     memset(s_pkt, 0, frames * DSPICO_NUM_CHANNELS * DSPICO_BYTES_PER_SAMPLE);
     got = frames;
   }
-  return (uint16_t)(got * DSPICO_NUM_CHANNELS * DSPICO_BYTES_PER_SAMPLE);
+
+  if (wire_bps == 2) {
+    // 16-bit fallback alt: truncate each 24-bit LE sample to its top 16 bits,
+    // in place (the destination never catches up with the source).
+    const size_t samples = got * DSPICO_NUM_CHANNELS;
+    for (size_t s = 0; s < samples; s++) {
+      s_pkt[s * 2 + 0] = s_pkt[s * 3 + 1];
+      s_pkt[s * 2 + 1] = s_pkt[s * 3 + 2];
+    }
+  }
+  return (uint16_t)(got * wire_bpf);
 }
 
 static void on_iso_complete(tuh_xfer_t *xfer);

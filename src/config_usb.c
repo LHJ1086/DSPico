@@ -13,6 +13,7 @@
 #include "dsp_peq.h"
 #include "signal_path.h"
 #include "usb_descriptors.h"
+#include "uac2_device.h"
 #include "config_usb.h"
 
 // --- Protocol (must match web/dspico.js PROTO) -----------------------------
@@ -216,6 +217,9 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     case REQ_RESET:
       if (stage != CONTROL_STAGE_SETUP) return true;
       peq_init(signal_path_peq(), (float) DSPICO_SAMPLE_RATE_HZ);
+      // peq_init wipes the gains too — reapply the OS volume/mute so a reset
+      // doesn't jump the loudness above what the host's slider says.
+      signal_path_set_host_gain(uac2_host_gain());
       return tud_control_xfer(rhport, request, NULL, 0);
   }
 

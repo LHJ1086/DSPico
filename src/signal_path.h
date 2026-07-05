@@ -17,7 +17,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "board_config.h"
 #include "dsp_peq.h"
+
+// Consumer-side priming: pull_play() returns nothing until this much audio is
+// buffered after a stream (re)start or an underrun, so playback begins with
+// enough cushion to ride out scheduling jitter instead of stuttering.
+#define SIGNAL_PATH_PRIME_MS     8u
+#define SIGNAL_PATH_PRIME_BYTES  (SIGNAL_PATH_PRIME_MS * DSPICO_FRAME_BYTES)
 
 // Initialise the PEQ (flat) and the play ring at the locked sample rate.
 void signal_path_init(void);

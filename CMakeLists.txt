@@ -49,6 +49,12 @@ add_executable(dspico
 # Tell Pico-PIO-USB it is being driven through TinyUSB's hcd/dcd glue.
 target_compile_definitions(dspico PRIVATE PIO_USB_USE_TINYUSB)
 
+# The Waveshare RP2350-USB-CM carries a 2 MB flash chip; the generic pico2
+# board header assumes 4 MB. This must match the real part — the EQ preset
+# lives in the LAST flash sector (config_usb.c), which would otherwise land
+# past the end of the chip.
+target_compile_definitions(dspico PRIVATE PICO_FLASH_SIZE_BYTES=2097152)
+
 # Generate ws2812.pio.h from the PIO source (uses the SDK's pioasm).
 pico_generate_pio_header(dspico ${CMAKE_CURRENT_LIST_DIR}/src/ws2812.pio)
 

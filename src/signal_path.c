@@ -16,6 +16,11 @@ static audio_ring_t s_play;
 static uint8_t  s_carry[FRAME_BYTES];
 static uint32_t s_carry_len;
 
+// Bumped on every stream (re)start (core0). The consumer (core1) discards
+// whatever is still queued from before the bump, so a new stream never opens
+// with the previous stream's stale tail.
+static volatile uint32_t s_stream_epoch;
+
 void signal_path_init(void) {
   peq_init(&s_peq, (float) DSPICO_SAMPLE_RATE_HZ);
   audio_ring_init(&s_play);
@@ -25,6 +30,7 @@ void signal_path_init(void) {
 void signal_path_on_stream_start(void) {
   peq_reset_state(&s_peq);
   s_carry_len = 0;
+  s_stream_epoch++;
 }
 
 // Process a whole number of frames (in a scratch buffer) and push to the ring.
@@ -35,9 +41,17 @@ static void process_and_push(const uint8_t *frames, uint32_t n_frames) {
 
   while (n_frames) {
     uint32_t f = n_frames > chunk_frames ? chunk_frames : n_frames;
+
+    // Only whole frames may enter the ring: a byte-truncated write would
+    // shift the producer/consumer frame alignment permanently. When the ring
+    // is (nearly) full, whole frames are dropped instead (drop-newest).
+    const uint32_t space_frames = audio_ring_free(&s_play) / FRAME_BYTES;
+    if (space_frames == 0) return;            // full — drop the rest of this burst
+    if (f > space_frames) f = space_frames;
+
     memcpy(scratch, frames, f * FRAME_BYTES);
     peq_process_interleaved_s24(&s_peq, scratch, f);
-    audio_ring_write(&s_play, scratch, f * FRAME_BYTES);   // drops if ring full
+    audio_ring_write(&s_play, scratch, f * FRAME_BYTES);
     frames    += f * FRAME_BYTES;
     n_frames  -= f;
   }
@@ -74,6 +88,31 @@ void signal_path_push_capture(const uint8_t *s24, uint32_t bytes) {
 }
 
 size_t signal_path_pull_play(uint8_t *dst, size_t max_frames) {
+  static uint32_t seen_epoch;   // core1-only state
+  static bool     primed;
+
+  // A new stream invalidates whatever is still queued: discard it so the new
+  // audio doesn't open with the previous stream's tail. (The producer bumps
+  // the epoch before pushing the new stream's data; at worst the first
+  // millisecond or two of the new stream is discarded along with the tail,
+  // which the priming below would have held back anyway.)
+  const uint32_t epoch = s_stream_epoch;
+  if (epoch != seen_epoch) {
+    seen_epoch = epoch;
+    primed = false;
+    uint8_t scrap[8 * FRAME_BYTES];
+    while (audio_ring_read(&s_play, scrap, sizeof(scrap))) {}
+  }
+
+  const uint32_t used = audio_ring_used(&s_play);
+  if (!primed) {
+    if (used < SIGNAL_PATH_PRIME_BYTES) return 0;   // build a cushion first
+    primed = true;
+  } else if (used == 0) {
+    primed = false;                                 // underrun: re-prime
+    return 0;
+  }
+
   uint32_t want = (uint32_t) max_frames * FRAME_BYTES;
   uint32_t got  = audio_ring_read(&s_play, dst, want);
   return got / FRAME_BYTES;

@@ -30,16 +30,19 @@ is pure on-core DSP and runs regardless.
 | **On-device parametric EQ** — N-band stereo SVF, 1 Hz–20 kHz, ±12 dB, Q 0.1–10, pre-gain, host-volume | ✅ implemented + **unit-tested** | `src/dsp_peq.*` |
 | **Signal path** — PC audio → pre-gain → PEQ → host volume → cross-core ring → DAC | ✅ implemented + **unit-tested** | `src/signal_path.*`, `src/audio_ring.h` |
 | **WebUSB configurator** — browser app + device vendor protocol, AutoEQ import, flash-persisted presets | ✅ implemented (app **unit-tested**) | `web/`, `src/config_usb.c` |
-| PIO **host** streams iso OUT to a DAC (test tone when idle) | ⚠️ **needs the hardware gate** | `src/uac_host.c`, `src/test_tone.c` |
+| **DAC format negotiation** — picks the DAC's stereo 48 kHz Type-I PCM alt; 24-bit preferred, 16-bit fallback (truncated) | ✅ implemented | `src/uac_host.c` |
+| **Iso OUT over PIO-USB** — carried patch teaches Pico-PIO-USB isochronous OUT (no-handshake per spec) | ✅ implemented, ⚠️ **needs the hardware gate** | `patches/`, `src/uac_host.c` |
 | Clock-domain feedback tuning; hot-plug/suspend robustness | ⛔ not yet (Phase 4/5) | — |
 
 > Honesty note: the **DSP and signal-path code is verified** — compiled with the
-> native compiler and checked numerically (see *Verifying the DSP* below). The
-> **USB-glue code could not be compiled here** (this environment can't fetch the
-> Pico SDK / TinyUSB / Pico-PIO-USB). It targets the TinyUSB in **Pico SDK 2.1.1**
-> and Pico-PIO-USB `master`; expect to iron out version-specific macro details at
-> first compile, and note the iso-over-PIO path in `uac_host.c` is the
-> experimental risk.
+> native compiler and checked numerically (see *Verifying the DSP* below), and
+> the **full firmware cross-compiles in CI** against Pico SDK **2.1.1**
+> (`.github/workflows/ci.yml` uploads the `.uf2`). Stock Pico-PIO-USB does
+> **not** implement isochronous OUT — its OUT path waits for a handshake that
+> iso never sends — so `setup.sh` pins the library to a known commit and applies
+> [`patches/0001-host-iso-out-no-handshake.patch`](patches/). The patched iso
+> path is spec-correct but **must still be validated on real hardware** (the
+> Phase 1b gate): desk analysis cannot prove the bit-banged timing holds.
 
 ---
 
@@ -84,7 +87,7 @@ not a solder fix, and is identical for both the -C and -CM variants.
 | **Git** | any | fetch the SDK + Pico-PIO-USB |
 | **Python** | 3.x | SDK helper scripts + `picotool` build |
 | **Pico SDK** | **2.0.0** (2.1.1 recommended) | RP2350 support (bundles TinyUSB) |
-| **Pico-PIO-USB** | `master` | the second (host) USB port — fetched by `setup.sh` |
+| **Pico-PIO-USB** | pinned commit (see `setup.sh`) | the second (host) USB port — fetched **and patched** by `setup.sh` |
 | `libusb-1.0` dev headers | any | needed to build `picotool` (which the SDK builds) |
 
 > RP2350 support only exists in Pico SDK **≥ 2.0.0** — an older SDK will fail.
@@ -172,12 +175,11 @@ From the repository root:
 ```
 
 This clones **Pico-PIO-USB** into `lib/Pico-PIO-USB` (the only vendored
-dependency; the SDK provides everything else). Re-running it is safe. If you
-prefer to do it by hand:
-
-```bash
-git clone --depth 1 https://github.com/sekigon-gonnoc/Pico-PIO-USB lib/Pico-PIO-USB
-```
+dependency; the SDK provides everything else), pins it to a known-good commit,
+and applies this repo's patches from [`patches/`](patches/) — currently the
+**isochronous-OUT host support** the audio path requires (stock Pico-PIO-USB
+waits for a handshake that iso transfers never send). Re-running it is safe;
+don't clone the library by hand or you'll miss the patch.
 
 ---
 
@@ -192,6 +194,12 @@ cmake --build build -j
 The first configure builds `picotool` and generates `ws2812.pio.h` from the PIO
 source — both automatic. A clean rebuild is `rm -rf build` then re-run the two
 commands.
+
+> **Flash size:** the build sets `PICO_FLASH_SIZE_BYTES` to **2 MB** (the chip
+> on the RP2350-USB-CM), overriding the generic `pico2` board's 4 MB assumption.
+> This matters because the EQ preset is persisted in the **last** flash sector.
+> If your board carries a different part, adjust the definition in
+> `CMakeLists.txt`.
 
 ---
 
@@ -278,12 +286,35 @@ green (streaming to DAC).
 
 ---
 
+## Runtime behavior (stability rules baked into the firmware)
+
+- **DAC format negotiation** — on enumeration the host driver reads the DAC's
+  descriptors and picks a **stereo 48 kHz Type-I PCM** alternate setting:
+  **24-bit (3-byte subslot) preferred**, with a **16-bit fallback** (samples
+  truncated to their top 16 bits). A DAC offering neither is rejected with a
+  clear UART message instead of being fed garbage. The choice is logged on the
+  debug UART (`DSPico host: DAC itf … alt …`).
+- **Priming** — playback toward the DAC starts only after ~8 ms of audio is
+  buffered (`SIGNAL_PATH_PRIME_BYTES`), so a stream opens with a cushion
+  instead of stuttering on scheduling jitter; an underrun silently re-primes.
+- **Underrun = silence, not tone** — while the PC is streaming, any gap is
+  filled with silence. The 1 kHz test tone plays only when *no* PC stream is
+  active (bench/gate mode).
+- **Overflow drops whole frames** — if the PC sends while no DAC drains, the
+  cross-core ring drops complete frames (newest first) and never shifts the
+  producer/consumer frame alignment (regression-tested in `tests/path_test.c`).
+- **Stream restarts flush stale audio** — (re)starting the PC stream discards
+  whatever tail the previous stream left in the ring.
+
+---
+
 ## Project layout
 
 ```
 CMakeLists.txt          top-level build (SDK + Pico-PIO-USB + pioasm for LED)
 pico_sdk_import.cmake    standard SDK locator
-setup.sh                 clones lib/Pico-PIO-USB
+setup.sh                 clones lib/Pico-PIO-USB at a pinned commit + applies patches/
+patches/                 carried Pico-PIO-USB patches (iso-OUT host support)
 docs/hardware-fix.md     board solder mods + meter-verify + decision flow
 src/
   board_config.h         pins, 120 MHz clock, locked audio format
