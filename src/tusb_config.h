@@ -122,7 +122,10 @@ extern "C" {
 // Allow a DAC that sits behind a hub, plus a small device table.
 #define CFG_TUH_HUB          1
 #define CFG_TUH_DEVICE_MAX   (CFG_TUH_HUB ? 4 : 1)
-#define CFG_TUH_ENUMERATION_BUFSIZE 256
+// The whole audio-function descriptor block must fit here or uac_host.c's
+// format parser can miss a valid alt setting. DACs with many alternate
+// settings easily exceed 256 bytes; RP2350 RAM affords the headroom.
+#define CFG_TUH_ENUMERATION_BUFSIZE 512
 
 // Enable the raw endpoint transfer API — our custom driver uses
 // usbh_edpt_open()/usbh_edpt_xfer() to open and pump the DAC's isochronous

@@ -13,4 +13,9 @@
 // signal_path_init().
 void config_usb_init(void);
 
+// Run deferred config work (currently: the flash commit requested by
+// REQ_COMMIT). Call from the core0 main loop — the sector erase + program is
+// far too slow to run inside the USB control callback.
+void config_usb_task(void);
+
 #endif // DSPICO_CONFIG_USB_H

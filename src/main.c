@@ -37,10 +37,10 @@ static size_t audio_source(uint8_t *dst, size_t max_frames) {
   if (frames == 0) {
     if (uac2_is_streaming()) {
       memset(dst, 0, max_frames * DSPICO_NUM_CHANNELS * DSPICO_BYTES_PER_SAMPLE);
+      frames = max_frames;
     } else {
-      test_tone_fill(dst, max_frames);
+      frames = test_tone_fill(dst, max_frames);   // returns frames
     }
-    frames = max_frames;
   }
   return frames;
 }
@@ -114,6 +114,7 @@ int main(void) {
 
   for (;;) {
     tud_task();
+    config_usb_task();   // deferred flash commit (too slow for a USB callback)
 
     // Coarse status: streaming to DAC > enumerated device > searching.
     led_state_t want;

@@ -45,6 +45,11 @@ TU_VERIFY_STATIC(sizeof(wire_band_t) == 16, "wire_band_t must be 16 bytes");
 static uint8_t s_ctrl_out[64];                       // inbound SET_* payloads
 static uint8_t s_state_buf[8 + PEQ_MAX_BANDS * 16];  // outbound GET_STATE
 
+// Set by REQ_COMMIT in the control callback, consumed by config_usb_task() in
+// the core0 main loop (same core, so a plain flag is enough; the callback runs
+// inside tud_task(), never from an ISR).
+static bool s_commit_pending = false;
+
 // ===========================================================================
 // Flash persistence (last sector). Writing flash must pause core1 (which runs
 // the PIO host from XIP) and disable IRQs on core0.
@@ -182,9 +187,11 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
 
     // --- App: set pre-gain (f32 dB) -----------------------------------------
     case REQ_SET_PREGAIN:
-      if (stage == CONTROL_STAGE_SETUP)
+      if (stage == CONTROL_STAGE_SETUP) {
+        if (request->wLength < 4) return false;   // short transfer -> STALL
         return tud_control_xfer(rhport, request, s_ctrl_out,
                                 request->wLength > sizeof(s_ctrl_out) ? sizeof(s_ctrl_out) : request->wLength);
+      }
       if (stage == CONTROL_STAGE_ACK) {
         float db; memcpy(&db, s_ctrl_out, 4);
         signal_path_set_pre_gain_db(db);
@@ -193,9 +200,11 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
 
     // --- App: set one band (wIndex high byte = slot) ------------------------
     case REQ_SET_BAND:
-      if (stage == CONTROL_STAGE_SETUP)
+      if (stage == CONTROL_STAGE_SETUP) {
+        if (request->wLength < sizeof(wire_band_t)) return false;   // STALL
         return tud_control_xfer(rhport, request, s_ctrl_out,
                                 request->wLength > sizeof(s_ctrl_out) ? sizeof(s_ctrl_out) : request->wLength);
+      }
       if (stage == CONTROL_STAGE_ACK) {
         const uint8_t idx = (uint8_t) (request->wIndex >> 8);
         wire_band_t w; memcpy(&w, s_ctrl_out, sizeof(w));
@@ -208,9 +217,13 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
       return true;
 
     // --- App: commit current EQ to flash ------------------------------------
+    // The write itself (sector erase + program, tens of ms with core0 IRQs off
+    // and core1 frozen) is far too slow for a control callback — blocking here
+    // would stall tud_task() and can make the host time the transfer out. ACK
+    // now, persist from the core0 main loop via config_usb_task().
     case REQ_COMMIT:
       if (stage != CONTROL_STAGE_SETUP) return true;
-      config_persist();
+      s_commit_pending = true;
       return tud_control_xfer(rhport, request, NULL, 0);
 
     // --- App: reset to flat -------------------------------------------------
@@ -224,4 +237,13 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
   }
 
   return false;   // unknown request -> STALL
+}
+
+// Runs deferred work that must not block the USB control callback. Call from
+// the core0 main loop, outside tud_task().
+void config_usb_task(void) {
+  if (s_commit_pending) {
+    s_commit_pending = false;
+    config_persist();
+  }
 }

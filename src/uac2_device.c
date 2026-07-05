@@ -25,13 +25,27 @@
 static int16_t s_volume_db256[DSPICO_NUM_CHANNELS + 1] = { -6 * 256, 0, 0 };
 static int8_t  s_mute[DSPICO_NUM_CHANNELS + 1] = { 0, 0, 0 };
 
-static volatile bool s_streaming = false;
+// Written on core0 (USB callbacks), read on core1 (the DAC fill path) — use
+// acquire/release atomics like the ring does, not a bare volatile.
+static bool s_streaming = false;
 
-bool uac2_is_streaming(void) { return s_streaming; }
+static inline void set_streaming(bool on) {
+  __atomic_store_n(&s_streaming, on, __ATOMIC_RELEASE);
+}
+
+bool uac2_is_streaming(void) {
+  return __atomic_load_n(&s_streaming, __ATOMIC_ACQUIRE);
+}
 
 float uac2_host_gain(void) {
   if (s_mute[0]) return 0.0f;
   // Convert master volume (1/256 dB) to a linear gain.
+  //
+  // Deliberately MASTER-ONLY: the descriptor advertises volume/mute controls
+  // on the master channel only (UAC2_FU_CTRL_MASTER in usb_descriptors.c), so
+  // compliant hosts drive index 0. Per-channel SETs are still accepted and
+  // stored (and read back by GET, keeping hosts consistent) but do not affect
+  // the audio — the signal path applies one gain to both channels.
   const float db = (float)s_volume_db256[0] / 256.0f;
   return powf(10.0f, db / 20.0f);
 }
@@ -45,11 +59,12 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
   const uint8_t alt = TU_U16_LOW(p_request->wValue);
 
   if (itf == ITF_NUM_AUDIO_STREAMING) {
-    s_streaming = (alt != 0);   // alt 1 = operational, alt 0 = zero bandwidth
-    if (s_streaming) {
+    const bool on = (alt != 0);   // alt 1 = operational, alt 0 = zero bandwidth
+    if (on) {
       signal_path_on_stream_start();               // clear filter history
       signal_path_set_host_gain(uac2_host_gain()); // apply current volume/mute
     }
+    set_streaming(on);
   }
   return true;
 }
@@ -58,7 +73,7 @@ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const 
   (void) rhport;
   const uint8_t itf = TU_U16_LOW(p_request->wIndex);
   if (itf == ITF_NUM_AUDIO_STREAMING) {
-    s_streaming = false;
+    set_streaming(false);
   }
   return true;
 }

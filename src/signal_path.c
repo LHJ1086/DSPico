@@ -18,8 +18,9 @@ static uint32_t s_carry_len;
 
 // Bumped on every stream (re)start (core0). The consumer (core1) discards
 // whatever is still queued from before the bump, so a new stream never opens
-// with the previous stream's stale tail.
-static volatile uint32_t s_stream_epoch;
+// with the previous stream's stale tail. Accessed with acquire/release
+// atomics (like the ring's indices), not a bare volatile.
+static uint32_t s_stream_epoch;
 
 void signal_path_init(void) {
   peq_init(&s_peq, (float) DSPICO_SAMPLE_RATE_HZ);
@@ -30,7 +31,7 @@ void signal_path_init(void) {
 void signal_path_on_stream_start(void) {
   peq_reset_state(&s_peq);
   s_carry_len = 0;
-  s_stream_epoch++;
+  __atomic_add_fetch(&s_stream_epoch, 1, __ATOMIC_RELEASE);
 }
 
 // Process a whole number of frames (in a scratch buffer) and push to the ring.
@@ -96,7 +97,7 @@ size_t signal_path_pull_play(uint8_t *dst, size_t max_frames) {
   // the epoch before pushing the new stream's data; at worst the first
   // millisecond or two of the new stream is discarded along with the tail,
   // which the priming below would have held back anyway.)
-  const uint32_t epoch = s_stream_epoch;
+  const uint32_t epoch = __atomic_load_n(&s_stream_epoch, __ATOMIC_ACQUIRE);
   if (epoch != seen_epoch) {
     seen_epoch = epoch;
     primed = false;

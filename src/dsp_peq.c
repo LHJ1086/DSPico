@@ -1,5 +1,9 @@
 // ---------------------------------------------------------------------------
-// DSPico — parametric EQ engine implementation (RBJ Audio EQ Cookbook).
+// DSPico — parametric EQ engine implementation.
+//
+// Each band is a TPT state-variable filter (Andrew Simper / Cytomic, "Solving
+// the continuous SVF equations using trapezoidal integration"), chosen over
+// Direct-Form RBJ biquads because it stays accurate in float32 down to ~1 Hz.
 // ---------------------------------------------------------------------------
 #include <math.h>
 #include <string.h>
@@ -10,8 +14,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#define S24_POS_FULL_SCALE  8388607.0f    //  2^23 - 1
-#define S24_NEG_FULL_SCALE  8388608.0f    //  2^23
+#define S24_NEG_FULL_SCALE  8388608.0f    //  2^23 (scale for both read + write)
 
 // Identity SVF: out = v0 (m1 = m2 = 0).
 static void coeffs_bypass(svf_coeffs_t *c) {
@@ -80,7 +83,6 @@ void peq_init(peq_t *p, float fs) {
   p->fs        = fs;
   p->pre_gain  = 1.0f;
   p->host_gain = 1.0f;
-  p->n_bands   = PEQ_MAX_BANDS;
   for (uint8_t i = 0; i < PEQ_MAX_BANDS; i++) {
     p->band[i].enabled = false;
     p->band[i].type    = PEQ_PEAKING;
@@ -167,9 +169,12 @@ static inline void wr_s24_le(uint8_t *p, int32_t v) {
   p[2] = (uint8_t) ((v >> 16) & 0xFF);
 }
 
+// Both branches scale by 2^23 — the same factor the read path divides by — so
+// a flat EQ round-trips every 24-bit value exactly (scaling +FS by 2^23-1
+// instead used to lose 1 LSB). The clamp keeps +FS at the representable max.
 static inline int32_t clamp_s24(float f) {
   if (f >= 0.0f) {
-    int32_t v = (int32_t) lrintf(f * S24_POS_FULL_SCALE);
+    int32_t v = (int32_t) lrintf(f * S24_NEG_FULL_SCALE);
     return v > 8388607 ? 8388607 : v;
   } else {
     int32_t v = (int32_t) lrintf(f * S24_NEG_FULL_SCALE);

@@ -2,7 +2,8 @@
 // DSPico — on-device parametric EQ engine (brief §5, §6b).
 //
 // This is the actual EQ that runs ON THE BRIDGE (not the PC): a stereo chain of
-// RBJ-cookbook biquads with a global pre-gain (headroom) stage in front and a
+// TPT state-variable filters (Cytomic SVF — see the svf_coeffs_t note below)
+// with a global pre-gain (headroom) stage in front and a
 // host-volume gain at the end. All math is float32 (hardware FPU). The device is
 // the source of truth for coefficients — the (future) WebUSB app only sends
 // high-level band parameters, which this module turns into coefficients.
@@ -59,7 +60,6 @@ typedef struct {
   float           fs;                 // sample rate, Hz
   float           pre_gain;           // linear, applied before the bands
   float           host_gain;          // linear, applied after (UAC2 volume/mute)
-  uint8_t         n_bands;            // active band slots in use (<= PEQ_MAX_BANDS)
   peq_band_t      band[PEQ_MAX_BANDS];
   svf_coeffs_t    coeffs[PEQ_MAX_BANDS];
   svf_state_t     state[2][PEQ_MAX_BANDS];  // [channel L/R][band]
@@ -94,6 +94,8 @@ void peq_process_stereo_f32(peq_t *p, float *l, float *r, size_t frames);
 void peq_process_interleaved_s24(peq_t *p, uint8_t *buf, size_t frames);
 
 // Suggested pre-gain (dB) = -(largest positive band gain), 0 if none boost.
+// Conservative heuristic: overlapping boosts near the same frequency can sum
+// above any single band, so extreme curves may still need more headroom.
 float peq_suggested_pre_gain_db(const peq_t *p);
 
 #endif // DSPICO_DSP_PEQ_H

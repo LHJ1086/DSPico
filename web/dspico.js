@@ -110,7 +110,9 @@ function parseAutoEq(text, maxBands = MAX_BANDS) {
 
 // ===========================================================================
 // Response curve — RBJ biquad magnitude (matches the device's per-band design
-// closely, and matches what AutoEQ assumes). For display only.
+// closely, and matches what AutoEQ assumes). DISPLAY-ONLY approximation: the
+// device itself runs a TPT state-variable filter (src/dsp_peq.c), which is
+// audibly identical but stays accurate at frequency extremes.
 // ===========================================================================
 function rbjCoeffs(band, fs) {
   const A = Math.pow(10, band.gain / 40);
@@ -203,7 +205,8 @@ function updateAutoHint(){
     if (b.enabled && b.gain > maxBoost &&
         (b.type===TYPE.PEAKING||b.type===TYPE.LOWSHELF||b.type===TYPE.HIGHSHELF))
       maxBoost = b.gain;
-  $('autoHint').textContent = maxBoost>0 ? `suggested: ${(-maxBoost).toFixed(1)} dB` : 'no boosts';
+  // Heuristic: covers the single largest boost; overlapping boosts can sum higher.
+  $('autoHint').textContent = maxBoost>0 ? `suggested (max band): ${(-maxBoost).toFixed(1)} dB` : 'no boosts';
 }
 
 // ---- Frequency-response graph ---------------------------------------------

@@ -79,7 +79,7 @@ static void test_flat_transparent(void) {
 }
 
 static void test_flat_s24_near_transparent(void) {
-  printf("flat EQ is near-transparent (24-bit path, within 1 LSB):\n");
+  printf("flat EQ is bit-transparent (24-bit path, 0 LSB deviation):\n");
   peq_t p; peq_init(&p, FS);
   int worst = 0;
   srand(12345);
@@ -99,7 +99,7 @@ static void test_flat_s24_near_transparent(void) {
     if (dl > worst) worst = dl;
     if (dr > worst) worst = dr;
   }
-  check(worst <= 1, "flat 24-bit path deviates <= 1 LSB");
+  check(worst == 0, "flat 24-bit path is bit-exact (0 LSB deviation)");
   printf("    (worst deviation: %d LSB)\n", worst);
 }
 

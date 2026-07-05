@@ -407,10 +407,10 @@ gcc -O2 -Wall -Wextra -I src -o path_test tests/path_test.c src/signal_path.c sr
 Measured results: peaking/shelf gains land within ~0.15 dB of target at Fc and
 are flat elsewhere; **the full range is exact — a +6 dB band reads +6.00 dB at
 1 Hz and at 20 kHz, and ±12 dB holds across Q 0.1–10**; out-of-range params clamp
-correctly; pre-gain scales exactly; a flat EQ is bit-transparent (within 1 LSB
-on the packed 24-bit path); and 640k frames survive ring wraparound with zero
-ordering errors. See [`tests/README.md`](tests/README.md) for the full coverage
-map.
+correctly; pre-gain scales exactly; a flat EQ is **bit-transparent — 0 LSB
+deviation on the packed 24-bit path**; and 640k frames survive ring wraparound
+with zero ordering errors. See [`tests/README.md`](tests/README.md) for the
+full coverage map.
 
 ---
 
@@ -442,8 +442,8 @@ skipped with a note. The device uses the same band count it reports over USB.
 
 **Device protocol.** Vendor control transfers on interface `ITF_NUM_VENDOR`
 (`src/config_usb.c`), kept in sync with `web/dspico.js`: `INFO`, `GET_STATE`,
-`SET_PREGAIN`, `SET_BAND`, `COMMIT` (persist to the last flash sector — core1 is
-frozen during the write), `RESET`. Driverless access uses a WebUSB BOS + MS OS
+`SET_PREGAIN`, `SET_BAND`, `COMMIT` (persist to the last flash sector — ACKed
+immediately, then written from the main loop with core1 briefly frozen), `RESET`. Driverless access uses a WebUSB BOS + MS OS
 2.0 (WinUSB) descriptor. Update the landing-page URL in `usb_descriptors.c`
 (`desc_url`) to wherever you host the page.
 
