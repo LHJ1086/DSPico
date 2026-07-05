@@ -40,15 +40,19 @@ jobs:
             https://github.com/raspberrypi/pico-sdk.git "${PICO_SDK_PATH}"
       - name: Fetch Pico-PIO-USB
         run: ./setup.sh
-      - name: Build firmware
+      - name: Build firmware (both board variants)
         run: |
-          cmake -B build -G Ninja -DPICO_BOARD=pico2
-          cmake --build build -j
+          cmake -B build-c  -G Ninja -DPICO_BOARD=pico2 -DDSPICO_BOARD_USB_CM=OFF
+          cmake --build build-c -j
+          cmake -B build-cm -G Ninja -DPICO_BOARD=pico2 -DDSPICO_BOARD_USB_CM=ON
+          cmake --build build-cm -j
       - name: Stage artifacts
         run: |
           mkdir -p dist
-          cp build/dspico.uf2 "dist/dspico-${REF_NAME}.uf2"
-          cp build/dspico.elf "dist/dspico-${REF_NAME}.elf"
+          cp build-c/dspico.uf2  "dist/dspico-${REF_NAME}-usb-c.uf2"
+          cp build-c/dspico.elf  "dist/dspico-${REF_NAME}-usb-c.elf"
+          cp build-cm/dspico.uf2 "dist/dspico-${REF_NAME}-usb-cm.uf2"
+          cp build-cm/dspico.elf "dist/dspico-${REF_NAME}-usb-cm.elf"
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -57,10 +61,14 @@ jobs:
           prerelease: ${{ startsWith(env.REF_NAME, 'v0.') }}
           generate_release_notes: true
           body: |
-            DSPico firmware for the Waveshare RP2350-USB-CM, built from
+            DSPico firmware for the Waveshare RP2350-USB-C / -CM, built from
             `${{ env.REF_NAME }}` against Pico SDK 2.1.1 (RP2350 / Cortex-M33).
 
-            **Flash:** hold BOOTSEL, tap reset, then drag `dspico-${{ env.REF_NAME }}.uf2`
+            **Pick your board variant** — the PIO-USB D+/D− pins are swapped
+            between them and the wrong file will not enumerate the DAC:
+            `…-usb-c.uf2` for the RP2350-USB-C, `…-usb-cm.uf2` for the -CM.
+
+            **Flash:** hold BOOTSEL, tap reset, then drag the matching `.uf2`
             onto the `RP2350` USB drive.
 
             ⚠️ The on-device parametric EQ and PC→EQ→DAC signal path are
@@ -68,5 +76,7 @@ jobs:
             path is not yet validated on hardware (the Phase 1b gate in the README).
             Treat this as an experimental pre-release.
           files: |
-            dist/dspico-${{ env.REF_NAME }}.uf2
-            dist/dspico-${{ env.REF_NAME }}.elf
+            dist/dspico-${{ env.REF_NAME }}-usb-c.uf2
+            dist/dspico-${{ env.REF_NAME }}-usb-c.elf
+            dist/dspico-${{ env.REF_NAME }}-usb-cm.uf2
+            dist/dspico-${{ env.REF_NAME }}-usb-cm.elf

@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "crc32.h"
 #include "dsp_peq.h"
 
 #ifndef M_PI
@@ -111,11 +112,83 @@ static void test_gain_stages_exact(void) {
   peq_process_stereo_f32(&p, &l, &r, 1);
   check_close(l, 0.5f * powf(10.0f, -6.0f / 20.0f), 1e-6f, "pre-gain -6 dB scales sample");
 
+  // _now snaps immediately (used by config reset)...
   peq_init(&p, FS);
-  peq_set_host_gain(&p, 0.25f);
+  peq_set_host_gain_now(&p, 0.25f);
   l = 0.8f; r = 0.8f;
   peq_process_stereo_f32(&p, &l, &r, 1);
-  check_close(l, 0.8f * 0.25f, 1e-6f, "host volume 0.25 scales sample");
+  check_close(l, 0.8f * 0.25f, 1e-6f, "host volume _now 0.25 scales first sample");
+
+  // ...while the normal setter reaches the same steady state after the ramp.
+  peq_init(&p, FS);
+  peq_set_host_gain(&p, 0.25f);
+  float last = 0.0f;
+  for (int n = 0; n < 480; n++) {           // 10 ms >> 5 ms full-scale slew
+    l = 0.8f; r = 0.8f;
+    peq_process_stereo_f32(&p, &l, &r, 1);
+    last = l;
+  }
+  check_close(last, 0.8f * 0.25f, 1e-6f, "host volume 0.25 exact after the ramp");
+}
+
+static void test_host_gain_ramp_is_click_free(void) {
+  printf("host-volume changes slew per-sample (no clicks), L/R identical:\n");
+  peq_t p; peq_init(&p, FS);
+  const float step = 1.0f / (0.005f * FS);   // engine's slew step
+
+  // Constant full-ish input: any output jump is purely the gain trajectory.
+  float prev_l = -1.0f;
+  bool bounded = true, lr_match = true, monotonic = true;
+  peq_set_host_gain(&p, 0.2f);               // 1.0 -> 0.2 while running
+  for (int n = 0; n < 400; n++) {
+    float l = 0.9f, r = 0.9f;
+    peq_process_stereo_f32(&p, &l, &r, 1);
+    if (l != r) lr_match = false;
+    if (n > 0) {
+      const float d = l - prev_l;
+      if (fabsf(d) > 0.9f * step + 1e-6f) bounded = false;   // <= input * step
+      if (d > 1e-7f) monotonic = false;                      // only ramps down
+    }
+    prev_l = l;
+  }
+  check(bounded,   "per-sample output delta never exceeds one slew step");
+  check(monotonic, "downward ramp is monotonic");
+  check(lr_match,  "L and R always get the same slewed gain");
+  check_close(prev_l, 0.9f * 0.2f, 1e-6f, "ramp settles on the exact target");
+
+  // Mute (target 0) fades out within ~5 ms instead of hard-cutting.
+  peq_set_host_gain(&p, 0.0f);
+  int frames_to_silence = 0;
+  for (int n = 0; n < 480; n++) {
+    float l = 0.9f, r = 0.9f;
+    peq_process_stereo_f32(&p, &l, &r, 1);
+    frames_to_silence++;
+    if (l == 0.0f) break;
+  }
+  check(frames_to_silence > 10 && frames_to_silence <= 240 + 1,
+        "mute fades over multiple samples and completes within ~5 ms");
+}
+
+static void test_identity_band_skipped(void) {
+  printf("a 0 dB peaking/shelf band is skipped, output identical to disabled:\n");
+  peq_t on, off;
+  peq_init(&on,  FS);
+  peq_init(&off, FS);
+  peq_band_t flat = { .enabled = true, .type = PEQ_PEAKING,
+                      .fc = 1000.0f, .gain_db = 0.0f, .q = 1.0f };
+  peq_set_band(&on, 0, &flat);              // enabled but exactly 0 dB
+  // `off` keeps every band disabled.
+
+  bool identical = true;
+  srand(555);
+  for (int n = 0; n < 4096; n++) {
+    float x = ((float) (rand() % 20001) - 10000.0f) / 10000.0f;
+    float l1 = x, r1 = -x, l2 = x, r2 = -x;
+    peq_process_stereo_f32(&on,  &l1, &r1, 1);
+    peq_process_stereo_f32(&off, &l2, &r2, 1);
+    if (l1 != l2 || r1 != r2) identical = false;
+  }
+  check(identical, "0 dB band output is bit-identical to no band");
 }
 
 static void test_clamp(void) {
@@ -197,11 +270,34 @@ static void test_shelves(void) {
   check_close(measure_gain_db(&p, 100.0f),   0.0f, 0.4f, "high shelf flat below corner");
 }
 
+static void test_crc32(void) {
+  printf("config-blob CRC-32 (ISO-HDLC) is correct and detects corruption:\n");
+  // Standard check value for this CRC variant.
+  check(dspico_crc32("123456789", 9) == 0xCBF43926u, "known vector matches");
+  check(dspico_crc32("", 0) == 0x00000000u, "empty input hashes to 0");
+
+  // A single flipped byte anywhere must change the CRC (torn-write model).
+  uint8_t blob[268];
+  for (size_t i = 0; i < sizeof(blob); i++) blob[i] = (uint8_t) (i * 7 + 3);
+  const uint32_t good = dspico_crc32(blob, sizeof(blob));
+  bool detected = true;
+  for (size_t i = 0; i < sizeof(blob); i += 13) {
+    blob[i] ^= 0xFF;
+    if (dspico_crc32(blob, sizeof(blob)) == good) detected = false;
+    blob[i] ^= 0xFF;
+  }
+  check(detected, "every single-byte corruption changes the CRC");
+  check(dspico_crc32(blob, sizeof(blob)) == good, "restored blob hashes clean");
+}
+
 int main(void) {
   printf("=== DSPico PEQ engine tests ===\n");
+  test_crc32();
   test_flat_transparent();
   test_flat_s24_near_transparent();
   test_gain_stages_exact();
+  test_host_gain_ramp_is_click_free();
+  test_identity_band_skipped();
   test_clamp();
   test_suggested_pregain();
   test_peaking_center_gain();

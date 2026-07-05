@@ -27,6 +27,18 @@
 #include "signal_path.h"
 #include "config_usb.h"
 
+// Enable FPU flush-to-zero + default-NaN on the CALLING core (FPSCR is
+// per-core, so each core that touches float must call this once). Denormal
+// operands cost many extra cycles on the M33 FPU, and the SVF integrator state
+// (dsp_peq.c) decays through the denormal range during silence — without FZ a
+// quiet passage can spike the DSP time and threaten audio deadlines.
+static void fpu_enable_flush_to_zero(void) {
+  uint32_t fpscr;
+  __asm volatile ("vmrs %0, fpscr" : "=r" (fpscr));
+  fpscr |= (1u << 24) | (1u << 25);   // FZ | DN
+  __asm volatile ("vmsr fpscr, %0" : : "r" (fpscr));
+}
+
 // The audio the host streams to the DAC: EQ'd PC audio from the play ring when
 // the PC is streaming, otherwise the firmware test tone (keeps the DAC fed and
 // lets the Phase 1b gate run with no PC attached). While the PC *is* streaming
@@ -49,14 +61,16 @@ static size_t audio_source(uint8_t *dst, size_t max_frames) {
 // core1 — PIO-USB host
 // ---------------------------------------------------------------------------
 static void core1_main(void) {
+  fpu_enable_flush_to_zero();   // core1 runs float too (test tone sinf)
+
   // The PIO-USB host is configured AND serviced on the core that owns its
-  // timing. Configure the data pins for this board's reversed layout (brief §3b).
+  // timing. Configure the data pins for this board's variant (board_config.h).
   pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
-  pio_cfg.pin_dp = DSPICO_PIO_USB_DP_PIN;      // GPIO13 = D+
+  pio_cfg.pin_dp = DSPICO_PIO_USB_DP_PIN;      // D+ (variant-specific, board_config.h)
 #if DSPICO_PIO_USB_PINOUT_DPDM_SWAP
-  pio_cfg.pinout = PIO_USB_PINOUT_DMDP;        // D- is the lower pin (GPIO12)
+  pio_cfg.pinout = PIO_USB_PINOUT_DMDP;        // -CM: D- is the lower pin
 #else
-  pio_cfg.pinout = PIO_USB_PINOUT_DPDM;
+  pio_cfg.pinout = PIO_USB_PINOUT_DPDM;        // -C:  D- is the higher pin
 #endif
 
   tuh_configure(DSPICO_RHPORT_HOST, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
@@ -74,6 +88,8 @@ static void core1_main(void) {
 // core0 — device stack + app
 // ---------------------------------------------------------------------------
 int main(void) {
+  fpu_enable_flush_to_zero();   // core0 runs the PEQ (see helper above)
+
   // Pico-PIO-USB requires a 120 MHz-derived system clock for correct Full-Speed
   // timing (brief §4). Do this BEFORE bringing up either USB stack.
   set_sys_clock_khz(DSPICO_SYS_CLK_KHZ, true);

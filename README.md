@@ -1,6 +1,7 @@
 # DSPico
 
-Inline digital **parametric-EQ USB bridge** for the Waveshare **RP2350-USB-CM**.
+Inline digital **parametric-EQ USB bridge** for the Waveshare **RP2350-USB-C**
+(default) / **RP2350-USB-CM** (`-DDSPICO_BOARD_USB_CM=ON`).
 
 ```
 PC / phone ──USB──► [ DSPico = RP2350 ] ──USB──► USB DAC
@@ -58,7 +59,8 @@ which fights the DAC's pull-up and corrupts the idle line when we act as host.
 1. If (and only if) host enumeration fails: **remove the 1.5 kΩ D+ pull-up.**
    Waveshare swaps this resistor's designator between board variants, so
    **trust the net, not the label** — remove whichever ~1.5 kΩ part sits between
-   the Type-C2 **D+ (GPIO13)** line and **3V3**, after confirming with a meter:
+   the Type-C2 **D+ net** (**GPIO12 on -C**, **GPIO13 on -CM**) and **3V3**,
+   after confirming with a meter:
 
    | Board variant | 1.5 kΩ D+ pull-up to remove | Empty footprint |
    |---------------|-----------------------------|-----------------|
@@ -71,9 +73,13 @@ which fights the DAC's pull-up and corrupts the idle line when we act as host.
    A **captive or Type-A-cabled** DAC also avoids Type-C CC negotiation issues.
 4. Leave the 27 Ω series resistors and the CC pull-downs alone — they're correct.
 
-The firmware already handles the reversed pin order (D− = GPIO12, D+ = GPIO13)
-via `DSPICO_PIO_USB_PINOUT_DPDM_SWAP` in `src/board_config.h` — this is config,
-not a solder fix, and is identical for both the -C and -CM variants.
+⚠️ **The D+/D− GPIO assignment is SWAPPED between the two variants** (verified
+on the -C schematic): **-C: D+ = GPIO12, D− = GPIO13**; **-CM: D+ = GPIO13,
+D− = GPIO12**. The firmware selects the right pinout at build time via
+`DSPICO_BOARD_USB_CM` in `src/board_config.h` (default **-C**; configure with
+`-DDSPICO_BOARD_USB_CM=ON` for -CM). This is config, not a solder fix — but
+flashing the wrong variant's build means the DAC will **never** enumerate, so
+check this before suspecting the resistor mod.
 
 ---
 
@@ -195,11 +201,16 @@ The first configure builds `picotool` and generates `ws2812.pio.h` from the PIO
 source — both automatic. A clean rebuild is `rm -rf build` then re-run the two
 commands.
 
-> **Flash size:** the build sets `PICO_FLASH_SIZE_BYTES` to **2 MB** (the chip
-> on the RP2350-USB-CM), overriding the generic `pico2` board's 4 MB assumption.
-> This matters because the EQ preset is persisted in the **last** flash sector.
-> If your board carries a different part, adjust the definition in
-> `CMakeLists.txt`.
+> **Flash size:** the build sets `PICO_FLASH_SIZE_BYTES` to **2 MB** (W25Q16
+> per the board schematic), overriding the generic `pico2` board's 4 MB
+> assumption. This matters because the EQ preset is persisted in the **last**
+> flash sector. If your board carries a different part, adjust the definition
+> in `CMakeLists.txt`.
+>
+> **Board variant:** the default build targets the **RP2350-USB-C**. For the
+> **RP2350-USB-CM** add `-DDSPICO_BOARD_USB_CM=ON` to the configure step — the
+> two variants have their PIO-USB D+/D− pins swapped and the wrong build will
+> not enumerate the DAC.
 
 ---
 
@@ -305,6 +316,18 @@ green (streaming to DAC).
   producer/consumer frame alignment (regression-tested in `tests/path_test.c`).
 - **Stream restarts flush stale audio** — (re)starting the PC stream discards
   whatever tail the previous stream left in the ring.
+- **Click-free volume** — the applied host gain slews toward the OS volume
+  target per sample (full scale in ~5 ms), so volume steps and mute never
+  click; a config **reset snaps** the gain so it can't ramp through the wrong
+  loudness. 0 dB bands are skipped outright (output-identical, cycles saved).
+- **CRC-protected presets** — the flash blob carries a CRC-32 over its payload;
+  a torn write (power loss mid-commit) is rejected at boot and the device
+  starts flat instead of loading garbage coefficients. Commits are also
+  deferred out of the USB control callback (ACK first, write from the main
+  loop) so a commit can't stall enumeration.
+- **FPU flush-to-zero** — both cores run with FZ+DN set, so decaying filter
+  state can't drag the M33 FPU through denormal territory during silence and
+  spike the DSP time.
 
 ---
 

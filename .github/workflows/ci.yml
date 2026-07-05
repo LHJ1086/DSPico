@@ -28,8 +28,14 @@ jobs:
         run: bash tests/run.sh
 
   firmware-build:
-    name: Firmware cross-build (RP2350)
+    name: Firmware cross-build (${{ matrix.variant.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { name: RP2350-USB-C,  cm_flag: 'OFF', suffix: usb-c }
+          - { name: RP2350-USB-CM, cm_flag: 'ON',  suffix: usb-cm }
     env:
       PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
     steps:
@@ -48,13 +54,13 @@ jobs:
       - name: Fetch Pico-PIO-USB
         run: ./setup.sh
       - name: Configure
-        run: cmake -B build -G Ninja -DPICO_BOARD=pico2
+        run: cmake -B build -G Ninja -DPICO_BOARD=pico2 -DDSPICO_BOARD_USB_CM=${{ matrix.variant.cm_flag }}
       - name: Build
         run: cmake --build build -j
       - name: Upload UF2
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: dspico-uf2
+          name: dspico-uf2-${{ matrix.variant.suffix }}
           path: build/dspico.uf2
           if-no-files-found: warn

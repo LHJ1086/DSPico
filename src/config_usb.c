@@ -2,6 +2,7 @@
 // DSPico — WebUSB config protocol handler + flash persistence.
 // ---------------------------------------------------------------------------
 #include <math.h>
+#include <stddef.h>
 #include <string.h>
 
 #include "tusb.h"
@@ -10,6 +11,7 @@
 #include "hardware/sync.h"
 
 #include "board_config.h"
+#include "crc32.h"
 #include "dsp_peq.h"
 #include "signal_path.h"
 #include "usb_descriptors.h"
@@ -28,7 +30,7 @@
 #define WEBUSB_REQUEST_GET_URL   2
 
 #define CFG_MAGIC   0x51505344u   // 'DSPQ'
-#define CFG_VERSION 1
+#define CFG_VERSION 2             // v2: added crc32 over the payload
 
 // One band as it travels on the wire / sits in flash (16 bytes).
 typedef struct TU_ATTR_PACKED {
@@ -61,10 +63,15 @@ typedef struct TU_ATTR_PACKED {
   uint16_t    version;
   uint8_t     n_bands;
   uint8_t     _pad;
+  uint32_t    crc32;        // over everything AFTER this field (the payload);
+                            // rejects torn writes (power loss mid-commit)
   float       pre_gain_db;
   wire_band_t band[PEQ_MAX_BANDS];
 } cfg_blob_t;
 TU_VERIFY_STATIC(sizeof(cfg_blob_t) <= FLASH_PAGE_SIZE * 2, "cfg blob too large");
+
+#define CFG_PAYLOAD_OFFSET offsetof(cfg_blob_t, pre_gain_db)
+#define CFG_PAYLOAD_LEN    (sizeof(cfg_blob_t) - CFG_PAYLOAD_OFFSET)
 
 static float linear_to_db(float lin) {
   if (lin <= 1e-6f) return -120.0f;
@@ -87,6 +94,8 @@ static void config_persist(void) {
     blob.band[i].gain_db = p->band[i].gain_db;
     blob.band[i].q       = p->band[i].q;
   }
+  blob.crc32 = dspico_crc32((const uint8_t *) &blob + CFG_PAYLOAD_OFFSET,
+                            CFG_PAYLOAD_LEN);
 
   // Program a whole number of 256-byte pages.
   static uint8_t page[((sizeof(cfg_blob_t) + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE];
@@ -104,6 +113,10 @@ static void config_persist(void) {
 void config_usb_init(void) {
   const cfg_blob_t *f = (const cfg_blob_t *) (XIP_BASE + CFG_FLASH_OFFSET);
   if (f->magic != CFG_MAGIC || f->version != CFG_VERSION) return;   // nothing saved
+  if (dspico_crc32((const uint8_t *) f + CFG_PAYLOAD_OFFSET, CFG_PAYLOAD_LEN)
+      != f->crc32) {
+    return;   // torn/corrupt blob — boot flat rather than load garbage
+  }
 
   signal_path_set_pre_gain_db(f->pre_gain_db);
   const uint8_t n = f->n_bands > PEQ_MAX_BANDS ? PEQ_MAX_BANDS : f->n_bands;
@@ -230,9 +243,10 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     case REQ_RESET:
       if (stage != CONTROL_STAGE_SETUP) return true;
       peq_init(signal_path_peq(), (float) DSPICO_SAMPLE_RATE_HZ);
-      // peq_init wipes the gains too — reapply the OS volume/mute so a reset
-      // doesn't jump the loudness above what the host's slider says.
-      signal_path_set_host_gain(uac2_host_gain());
+      // peq_init wipes the gains too — SNAP (not ramp) the OS volume/mute back
+      // in, otherwise a reset at low volume would slew from unity through a
+      // brief loud burst.
+      peq_set_host_gain_now(signal_path_peq(), uac2_host_gain());
       return tud_control_xfer(rhport, request, NULL, 0);
   }
 
@@ -242,7 +256,10 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
 // Runs deferred work that must not block the USB control callback. Call from
 // the core0 main loop, outside tud_task().
 void config_usb_task(void) {
-  if (s_commit_pending) {
+  // Hold the commit until core1's lockout victim is up — freezing core1 is
+  // mandatory during the flash write (it executes from XIP), and requesting a
+  // lockout before the victim exists would block forever. Retries next loop.
+  if (s_commit_pending && multicore_lockout_victim_is_initialized(1)) {
     s_commit_pending = false;
     config_persist();
   }

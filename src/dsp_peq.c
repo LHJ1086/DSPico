@@ -78,11 +78,24 @@ static void design_band(const peq_band_t *b, float fs, svf_coeffs_t *c) {
   c->m2 = m2;
 }
 
+// A band whose response is exactly unity (0 dB peaking/shelf) is skipped
+// outright — the SVF would return the input bit-for-bit anyway (m0=1, m1=m2=0),
+// so skipping is output-identical and saves the filter work.
+static bool band_is_identity(const peq_band_t *b) {
+  return (b->type == PEQ_PEAKING || b->type == PEQ_LOWSHELF ||
+          b->type == PEQ_HIGHSHELF) &&
+         fabsf(b->gain_db) < 0.01f;
+}
+
 void peq_init(peq_t *p, float fs) {
   memset(p, 0, sizeof(*p));
-  p->fs        = fs;
-  p->pre_gain  = 1.0f;
-  p->host_gain = 1.0f;
+  p->fs            = fs;
+  p->pre_gain      = 1.0f;
+  p->host_gain     = 1.0f;
+  p->host_gain_cur = 1.0f;
+  // Slew the applied host gain across ~5 ms for a full 0..1 swing, so volume
+  // steps and mute are click-free but still feel instant.
+  p->gain_step     = 1.0f / (0.005f * fs);
   for (uint8_t i = 0; i < PEQ_MAX_BANDS; i++) {
     p->band[i].enabled = false;
     p->band[i].type    = PEQ_PEAKING;
@@ -108,6 +121,7 @@ void peq_set_band(peq_t *p, uint8_t idx, const peq_band_t *band) {
   p->band[idx] = *band;
   peq_clamp_band(&p->band[idx]);
   design_band(&p->band[idx], p->fs, &p->coeffs[idx]);
+  p->band_active[idx] = p->band[idx].enabled && !band_is_identity(&p->band[idx]);
 }
 
 void peq_set_pre_gain_db(peq_t *p, float db) {
@@ -115,12 +129,18 @@ void peq_set_pre_gain_db(peq_t *p, float db) {
 }
 
 void peq_set_host_gain(peq_t *p, float linear) {
-  p->host_gain = linear;
+  p->host_gain = linear;          // target; the frame loops slew toward it
+}
+
+void peq_set_host_gain_now(peq_t *p, float linear) {
+  p->host_gain     = linear;
+  p->host_gain_cur = linear;
 }
 
 void peq_recompute(peq_t *p) {
   for (uint8_t i = 0; i < PEQ_MAX_BANDS; i++) {
     design_band(&p->band[i], p->fs, &p->coeffs[i]);
+    p->band_active[i] = p->band[i].enabled && !band_is_identity(&p->band[i]);
   }
 }
 
@@ -138,21 +158,38 @@ static inline float svf_step(const svf_coeffs_t *c, svf_state_t *s, float v0) {
   return c->m0 * v0 + c->m1 * v1 + c->m2 * v2;
 }
 
-// Run one channel's whole chain (pre-gain -> enabled bands -> host volume).
-static inline float process_sample(peq_t *p, uint8_t ch, float x) {
+// Run one channel's filter chain (pre-gain -> active bands). Host volume is
+// applied by the frame loops so its slewed value is identical for L and R.
+static inline float process_chain(peq_t *p, uint8_t ch, float x) {
   x *= p->pre_gain;
   for (uint8_t i = 0; i < PEQ_MAX_BANDS; i++) {
-    if (p->band[i].enabled) {
+    if (p->band_active[i]) {
       x = svf_step(&p->coeffs[i], &p->state[ch][i], x);
     }
   }
-  return x * p->host_gain;
+  return x;
+}
+
+// Advance the applied host gain one frame toward its target (bounded linear
+// slew — click-free volume/mute). Collapses to a single compare when settled.
+static inline float advance_host_gain(peq_t *p) {
+  float cur = p->host_gain_cur;
+  const float tgt = p->host_gain;
+  if (cur != tgt) {
+    const float d = tgt - cur;
+    if      (d >  p->gain_step) cur += p->gain_step;
+    else if (d < -p->gain_step) cur -= p->gain_step;
+    else                        cur  = tgt;
+    p->host_gain_cur = cur;
+  }
+  return cur;
 }
 
 void peq_process_stereo_f32(peq_t *p, float *l, float *r, size_t frames) {
   for (size_t n = 0; n < frames; n++) {
-    l[n] = process_sample(p, 0, l[n]);
-    r[n] = process_sample(p, 1, r[n]);
+    const float g = advance_host_gain(p);
+    l[n] = process_chain(p, 0, l[n]) * g;
+    r[n] = process_chain(p, 1, r[n]) * g;
   }
 }
 
@@ -190,8 +227,9 @@ void peq_process_interleaved_s24(peq_t *p, uint8_t *buf, size_t frames) {
     float l = (float) rd_s24_le(fl) / S24_NEG_FULL_SCALE;
     float r = (float) rd_s24_le(fr) / S24_NEG_FULL_SCALE;
 
-    l = process_sample(p, 0, l);
-    r = process_sample(p, 1, r);
+    const float g = advance_host_gain(p);
+    l = process_chain(p, 0, l) * g;
+    r = process_chain(p, 1, r) * g;
 
     wr_s24_le(fl, clamp_s24(l));
     wr_s24_le(fr, clamp_s24(r));

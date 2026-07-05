@@ -38,7 +38,9 @@ expects and fixes missed hot-plug (connect/disconnect) events.
 ## Verify with a meter BEFORE desoldering
 
 1. Power off / unplug the board.
-2. Confirm **R13 reads ~1.5 kΩ** between **GPIO13 (D+)** and the **3V3** rail.
+2. Confirm **R13 reads ~1.5 kΩ** between **GPIO12 (D+ on the -C)** and the
+   **3V3** rail. (On the -CM the D+ net is GPIO13 and the populated part is
+   R10 — the variants swap both the data pins and the designators.)
 3. Confirm **R10's pads are bare** (no part fitted).
 4. If your board revision doesn't match (designators shuffle between revs):
    probe for whichever small resistor sits between the Type_C2 D+ line and 3V3
@@ -62,11 +64,18 @@ Then desolder R13 (fine-tip iron or hot tweezers; it's a small SMD part).
 
 ## Firmware pin config (not a solder fix, but must match the board)
 
-- **D+ = GPIO13, D− = GPIO12** on the PIO port.
-- D+ is the **higher-numbered** pin — the *reverse* of Pico-PIO-USB's default
-  (dp, dp+1) order. Set the library's pin / pinout-swap option so polarity is
-  correct, or it will not enumerate. This is a config setting, not a board mod.
-  DSPico sets this via `DSPICO_PIO_USB_PINOUT_DPDM_SWAP` in `src/board_config.h`.
+⚠️ **The PIO-USB D+/D− GPIO assignment is swapped between variants** (verified
+against the RP2350-USB-C schematic: GPIO12 → 27 Ω → DB_P, GPIO13 → 27 Ω → DB_N,
+and the populated 1.5 kΩ D+ pull-up R13 hangs on the GPIO12 net):
+
+| Variant | D+ | D− | Pico-PIO-USB pinout |
+|---------|----|----|---------------------|
+| **RP2350-USB-C** (default build) | **GPIO12** | GPIO13 | `DPDM` (D− = D+ + 1) |
+| RP2350-USB-CM (`-DDSPICO_BOARD_USB_CM=ON`) | **GPIO13** | GPIO12 | `DMDP` (D− = D+ − 1) |
+
+Wrong polarity means the DAC **never enumerates** — flash the correct variant's
+build *before* reaching for the soldering iron. DSPico selects this via
+`DSPICO_BOARD_USB_CM` in `src/board_config.h`.
 
 ---
 

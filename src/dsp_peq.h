@@ -59,7 +59,10 @@ typedef struct { float ic1eq, ic2eq; }           svf_state_t;   // 2 integrators
 typedef struct {
   float           fs;                 // sample rate, Hz
   float           pre_gain;           // linear, applied before the bands
-  float           host_gain;          // linear, applied after (UAC2 volume/mute)
+  float           host_gain;          // TARGET host gain (UAC2 volume/mute)
+  float           host_gain_cur;      // applied gain, slewed toward host_gain
+  float           gain_step;          // per-frame slew step (~5 ms full scale)
+  bool            band_active[PEQ_MAX_BANDS];  // enabled AND not identity
   peq_band_t      band[PEQ_MAX_BANDS];
   svf_coeffs_t    coeffs[PEQ_MAX_BANDS];
   svf_state_t     state[2][PEQ_MAX_BANDS];  // [channel L/R][band]
@@ -77,8 +80,13 @@ void peq_set_band(peq_t *p, uint8_t idx, const peq_band_t *band);
 void peq_clamp_band(peq_band_t *band);
 
 // Global pre-gain / host-volume. Rule of thumb: pre_gain_db <= -(max band boost).
+// peq_set_host_gain sets a TARGET: the applied gain slews toward it per frame
+// (full scale in ~5 ms) so OS volume steps and mutes never click. Use the
+// _now variant to snap both (e.g. on a config reset, to avoid a ramp through
+// the wrong loudness).
 void peq_set_pre_gain_db(peq_t *p, float db);
 void peq_set_host_gain(peq_t *p, float linear);
+void peq_set_host_gain_now(peq_t *p, float linear);
 
 // Recompute all band coefficients (e.g. after a bulk config load).
 void peq_recompute(peq_t *p);
