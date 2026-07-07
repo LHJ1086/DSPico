@@ -6,7 +6,7 @@
 
 // Bumped on every configurator change and printed in the Ready line, so a
 // stale/cached deployment is immediately visible in any pasted log.
-const APP_REV = 'r8';
+const APP_REV = 'r9';
 
 // --- Shared protocol contract (keep in sync with the firmware) --------------
 const PROTO = {
@@ -283,11 +283,28 @@ function connectHint(step, err){
     lines.push('The interface was claimed but the device did not answer the INFO request —');
     lines.push('likely an old firmware on the device. Reflash the current dspico.uf2.');
   }
+  if (err.name === 'TimeoutError') {
+    lines.push('A USB operation hung — usually the OS re-enumerating the device mid-call.');
+    lines.push('Unplug the DSPico, wait 3 seconds, replug, and let the page auto-connect.');
+  }
   return lines.join('\n');
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const DSPICO_FILTER = { vendorId: 0x1209, productId: 0xD590 };
+
+// Every USB await is time-boxed: a hung promise (device re-enumerating mid
+// operation) must fail loudly and release the connect guard, never wedge the
+// page into a state where clicking Connect does nothing.
+function withTimeout(promise, ms, what){
+  let t;
+  const killer = new Promise((_, rej) => {
+    t = setTimeout(() => rej(Object.assign(
+      new Error(`${what} timed out after ${ms} ms — the device stopped responding (replug and retry)`),
+      { name: 'TimeoutError' })), ms);
+  });
+  return Promise.race([promise, killer]).finally(() => clearTimeout(t));
+}
 
 // A device object already granted permission (no chooser needed), or null.
 async function getPermittedDevice(){
@@ -302,13 +319,13 @@ async function getPermittedDevice(){
 // getDevices() (the old object can be permanently poisoned), and try again.
 async function openWithRetry(dev){
   for (let attempt = 0; ; attempt++) {
-    try { await dev.open(); return dev; }
+    try { await withTimeout(dev.open(), 3000, 'open'); return dev; }
     catch (e) {
       const transient = e.name === 'InvalidStateError' || e.name === 'NotFoundError' ||
-                        /disconnected|in progress/i.test(e.message);
+                        e.name === 'TimeoutError' || /disconnected|in progress/i.test(e.message);
       if (attempt >= 4 || !transient) throw e;
       log(`open busy (${e.name}), retry ${attempt + 1}/4…`);
-      try { await dev.close(); } catch (_) {}
+      try { await withTimeout(dev.close(), 1000, 'close'); } catch (_) {}
       await sleep(700);
       const fresh = await getPermittedDevice();
       if (fresh) dev = fresh;
@@ -321,26 +338,40 @@ async function openWithRetry(dev){
 let connectInFlight = false;
 async function connect(interactive = true){
   if (!('usb' in navigator)) { log('WebUSB not available — use Chrome/Edge over https or localhost.', 'e'); return; }
-  if (connectInFlight || usbDevice) return;   // one attempt at a time
+  if (connectInFlight) { log('(connect already in progress — ignored)'); return; }
+  if (usbDevice)       { log('(already connected)'); return; }
   connectInFlight = true;
   let step = 'requestDevice';
   try {
+    // After a replug, Windows can spend several seconds re-binding drivers,
+    // during which the device is invisible to the browser. Auto-connect polls
+    // patiently; the manual path checks once then falls back to the chooser.
     let dev = await getPermittedDevice();
+    for (let i = 0; !dev && !interactive && i < 8; i++) {
+      await sleep(1200);
+      dev = await getPermittedDevice();
+    }
     if (!dev) {
-      if (!interactive) return;                 // nothing permitted yet — stay quiet
+      if (!interactive) {
+        log('DSPico not visible to the browser (drivers still installing?) — click "Connect device" to retry.');
+        return;
+      }
       dev = await navigator.usb.requestDevice({ filters: [DSPICO_FILTER] });
     }
     step = 'open';           usbDevice = await openWithRetry(dev);
     step = 'selectConfiguration';
-    if (usbDevice.configuration === null) await usbDevice.selectConfiguration(1);
-    step = 'claimInterface'; await usbDevice.claimInterface(PROTO.ITF_VENDOR);
-    step = 'readInfo';       await readInfo();
+    if (usbDevice.configuration === null)
+      await withTimeout(usbDevice.selectConfiguration(1), 3000, 'selectConfiguration');
+    step = 'claimInterface';
+    await withTimeout(usbDevice.claimInterface(PROTO.ITF_VENDOR), 3000, 'claimInterface');
+    step = 'readInfo';
+    await withTimeout(readInfo(), 3000, 'readInfo');
     setConnected(true);
     log('Connected.');
   } catch (err) {
     log(connectHint(step, err), 'e');
     setConnected(false);
-    try { if (usbDevice) await usbDevice.close(); } catch (_) {}
+    try { if (usbDevice) await withTimeout(usbDevice.close(), 1000, 'close'); } catch (_) {}
     usbDevice = null;
   } finally {
     connectInFlight = false;
@@ -524,13 +555,12 @@ if ('usb' in navigator) {
       log('Device unplugged.');
     }
   });
-  navigator.usb.addEventListener('connect', async (e)=>{
+  navigator.usb.addEventListener('connect', (e)=>{
     if (!usbDevice &&
         e.device.vendorId === DSPICO_FILTER.vendorId &&
         e.device.productId === DSPICO_FILTER.productId) {
       log('DSPico plugged in — connecting…');
-      await sleep(800);          // let the OS finish binding drivers
-      connect(false);
+      connect(false);            // polls while the OS finishes driver binding
     }
   });
 }
@@ -539,7 +569,11 @@ if ('usb' in navigator) {
 state.bands = [ newBand({type:TYPE.LOWSHELF, fc:105, gain:4, q:0.7}),
                 newBand({type:TYPE.PEAKING, fc:3000, gain:-3, q:1.5}) ];
 renderBands();
-log(`Ready — configurator ${APP_REV}. Design offline, or Connect a DSPico to push live.`);
+{
+  const chrome = (navigator.userAgent.match(/(Chrome|Edg)\/[\d.]+/g) || []).join(' ');
+  log(`Ready — configurator ${APP_REV} · ${navigator.platform || '?'} · ${chrome || navigator.userAgent.slice(0, 40)}`);
+  log('Design offline, or Connect a DSPico to push live.');
+}
 
 // Reconnect silently if this browser already has permission for a DSPico.
 getPermittedDevice().then(d => { if (d) { log('Found permitted DSPico — auto-connecting…'); connect(false); } })
