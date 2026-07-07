@@ -1,0 +1,113 @@
+diff --git a/src/pio_usb.c b/src/pio_usb.c
+index 05dce39..14ef5f6 100644
+--- a/src/pio_usb.c
++++ b/src/pio_usb.c
+@@ -124,7 +124,7 @@ void __no_inline_not_in_flash_func(pio_usb_bus_send_token)(pio_port_t *pp,
+   packet[3] = (crc << 3) | ((dat >> 8) & 0x1f);
+ 
+   uint8_t packet_encoded[sizeof(packet) * 2 * 7 / 6 + 2];
+-  uint8_t encoded_len = pio_usb_ll_encode_tx_data(packet, sizeof(packet), packet_encoded);
++  uint16_t encoded_len = pio_usb_ll_encode_tx_data(packet, sizeof(packet), packet_encoded);
+ 
+   pio_usb_bus_usb_transfer(pp, packet_encoded, encoded_len);
+ }
+@@ -456,15 +456,15 @@ void __no_inline_not_in_flash_func(pio_usb_ll_configure_endpoint)(
+ }
+ 
+ // Encode transfer data to 2bit sequence represents TX PIO instruction address
+-uint8_t __no_inline_not_in_flash_func(pio_usb_ll_encode_tx_data)(
+-    uint8_t const *buffer, uint8_t buffer_len, uint8_t *encoded_data) {
++uint16_t __no_inline_not_in_flash_func(pio_usb_ll_encode_tx_data)(
++    uint8_t const *buffer, uint16_t buffer_len, uint8_t *encoded_data) {
+   uint16_t bit_idx = 0;
+   int current_state = 1;
+   int bit_stuffing = 6;
+   for (int idx = 0; idx < buffer_len; idx++) {
+     uint8_t data_byte = buffer[idx];
+     for (int b = 0; b < 8; b++) {
+-      uint8_t byte_idx = bit_idx >> 2;
++      uint16_t byte_idx = bit_idx >> 2;
+       encoded_data[byte_idx] <<= 2;
+       if (data_byte & (1 << b)) {
+         if (current_state) {
+@@ -503,7 +503,7 @@ uint8_t __no_inline_not_in_flash_func(pio_usb_ll_encode_tx_data)(
+     }
+   }
+ 
+-  uint8_t byte_idx = bit_idx >> 2;
++  uint16_t byte_idx = bit_idx >> 2;
+   encoded_data[byte_idx] <<= 2;
+   encoded_data[byte_idx] |= PIO_USB_TX_ENCODED_DATA_SE0;
+   bit_idx++;
+diff --git a/src/pio_usb_configuration.h b/src/pio_usb_configuration.h
+index 3635db4..173fdc1 100644
+--- a/src/pio_usb_configuration.h
++++ b/src/pio_usb_configuration.h
+@@ -49,4 +49,10 @@ typedef struct {
+ #define PIO_USB_HUB_PORT_CNT 8
+ #define PIO_USB_ROOT_PORT_CNT 2
+ 
+-#define PIO_USB_EP_SIZE 64
++// Max transaction payload per endpoint. The stock 64 covers bulk/interrupt;
++// full-speed ISOCHRONOUS audio needs up to wMaxPacketSize bytes in a single
++// transaction (e.g. 576 for a 96-frame 24-bit stereo alt), so size for that.
++// Endpoint buffers hold the bit-stuff-encoded form (~2.34x), see endpoint_t.
++#ifndef PIO_USB_EP_SIZE
++#define PIO_USB_EP_SIZE 580
++#endif
+diff --git a/src/pio_usb_host.c b/src/pio_usb_host.c
+index 7c18e5f..9bc35a4 100644
+--- a/src/pio_usb_host.c
++++ b/src/pio_usb_host.c
+@@ -585,6 +585,21 @@ static int __no_inline_not_in_flash_func(usb_out_transaction)(pio_port_t *pp,
+ 
+   uint16_t const xact_len = pio_usb_ll_get_transaction_len(ep);
+ 
++  if ((ep->attr & 0x03) == EP_ATTR_ISOCHRONOUS) {
++    // Isochronous transactions have no handshake phase (USB 2.0 sec 8.5.5):
++    // send the token + data and complete immediately instead of waiting for
++    // an ACK that will never arrive. Full-speed isochronous always uses
++    // DATA0, so undo the data-toggle done by pio_usb_ll_transfer_continue().
++    // Callers must submit at most wMaxPacketSize per transfer (one
++    // transaction per frame), which the TinyUSB hcd glue already does.
++    pio_usb_bus_send_token(pp, USB_PID_OUT, ep->dev_addr, ep->ep_num);
++    pio_usb_bus_usb_transfer(pp, ep->buffer, ep->encoded_data_len);
++    pio_usb_ll_transfer_continue(ep, xact_len);
++    ep->data_id = 0;
++    ep->failed_count = 0;
++    return 0;
++  }
++
+   pio_usb_bus_prepare_receive(pp);
+   pio_usb_bus_send_token(pp, USB_PID_OUT, ep->dev_addr, ep->ep_num);
+ 
+diff --git a/src/pio_usb_ll.h b/src/pio_usb_ll.h
+index 2137bcb..b3675d3 100644
+--- a/src/pio_usb_ll.h
++++ b/src/pio_usb_ll.h
+@@ -195,8 +195,8 @@ enum {
+   PIO_USB_TX_ENCODED_DATA_COMP = 2,
+   PIO_USB_TX_ENCODED_DATA_J = 3,
+ };
+-uint8_t pio_usb_ll_encode_tx_data(uint8_t const *buffer, uint8_t buffer_len,
+-                                  uint8_t *encoded_data);
++uint16_t pio_usb_ll_encode_tx_data(uint8_t const *buffer, uint16_t buffer_len,
++                                   uint8_t *encoded_data);
+ 
+ //--------------------------------------------------------------------
+ // Host Controller functions
+diff --git a/src/usb_definitions.h b/src/usb_definitions.h
+index 6733264..fa03744 100644
+--- a/src/usb_definitions.h
++++ b/src/usb_definitions.h
+@@ -73,8 +73,8 @@ typedef struct {
+   volatile bool transfer_started;
+   volatile bool transfer_aborted;
+ 
+-  uint8_t buffer[(64 + 4) * 2 * 7 / 6 + 2];
+-  uint8_t encoded_data_len;
++  uint8_t buffer[(PIO_USB_EP_SIZE + 4) * 2 * 7 / 6 + 2];
++  uint16_t encoded_data_len;   // encoded large iso packets exceed 255 bytes
+   uint8_t failed_count;
+ 
+   uint8_t *app_buf;

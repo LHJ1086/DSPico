@@ -32,18 +32,15 @@ fi
 if ! git -C "${PIO_USB_DIR}" cat-file -e "${PIO_USB_COMMIT}^{commit}" 2>/dev/null; then
     git -C "${PIO_USB_DIR}" fetch origin "${PIO_USB_COMMIT}"
 fi
-if [ "$(git -C "${PIO_USB_DIR}" rev-parse HEAD)" != "${PIO_USB_COMMIT}" ]; then
-    # A previously patched tree can't switch commits with dirty files; patches
-    # are re-applied below, so a hard reset is safe here.
-    git -C "${PIO_USB_DIR}" checkout --force --detach "${PIO_USB_COMMIT}"
-fi
 
-# Apply this repo's patches (idempotent: skip any patch already applied).
+# Reset to the pristine pinned tree, then apply this repo's patches. The reset
+# makes re-runs idempotent even when the patch files themselves have changed.
+git -C "${PIO_USB_DIR}" checkout --force --detach "${PIO_USB_COMMIT}" 2>/dev/null
+git -C "${PIO_USB_DIR}" checkout -- .
+
 for patch in "${REPO_ROOT}"/patches/*.patch; do
     [ -e "${patch}" ] || continue
-    if git -C "${PIO_USB_DIR}" apply --reverse --check "${patch}" 2>/dev/null; then
-        echo "Patch already applied: $(basename "${patch}")"
-    elif git -C "${PIO_USB_DIR}" apply --check "${patch}" 2>/dev/null; then
+    if git -C "${PIO_USB_DIR}" apply --check "${patch}" 2>/dev/null; then
         git -C "${PIO_USB_DIR}" apply "${patch}"
         echo "Applied patch: $(basename "${patch}")"
     else

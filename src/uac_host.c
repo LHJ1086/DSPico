@@ -259,6 +259,17 @@ static void on_set_freq_complete(tuh_xfer_t *xfer);
 static void (*s_timeout_next)(void);
 static uint32_t s_step_deadline_ms;        // 0 = no step pending
 
+// Generation token: every chain submit carries it in user_data. An aborted
+// transfer's completion event can still arrive later (abort vs. completion
+// race in the frame IRQ); callbacks ignore anything from an old generation
+// so the chain can't be double-driven.
+static uint32_t s_chain_gen;
+
+// After an abort, let the bus/stack settle a couple of frames before the next
+// step instead of submitting from inside the same task pass.
+static void (*s_deferred_next)(void);
+static uint32_t s_deferred_at_ms;
+
 static void arm_step_watchdog(void (*on_timeout)(void)) {
   s_timeout_next = on_timeout;
   uint32_t dl = to_ms_since_boot(get_absolute_time()) + SETUP_STEP_TIMEOUT_MS;
@@ -266,15 +277,31 @@ static void arm_step_watchdog(void (*on_timeout)(void)) {
 }
 static void disarm_step_watchdog(void) { s_step_deadline_ms = 0; }
 
+// True (and logs) when a completion belongs to an aborted/older submit.
+static bool stale_completion(tuh_xfer_t *xfer) {
+  if ((uint32_t) xfer->user_data == s_chain_gen) return false;
+  dlog("DSPico host: stale completion ignored\n");
+  return true;
+}
+
 void uac_host_task(void) {
+  const uint32_t now = to_ms_since_boot(get_absolute_time());
+
+  if (s_deferred_next && (int32_t) (now - s_deferred_at_ms) >= 0) {
+    void (*fn)(void) = s_deferred_next;
+    s_deferred_next = NULL;
+    fn();
+  }
+
   if (s_step_deadline_ms == 0 || !s_dac.in_use) return;
-  if ((int32_t) (to_ms_since_boot(get_absolute_time()) - s_step_deadline_ms) < 0) return;
+  if ((int32_t) (now - s_step_deadline_ms) < 0) return;
   s_step_deadline_ms = 0;
   dlog("DSPico host: control step TIMED OUT (device NAKing?) — aborting + continuing\n");
+  s_chain_gen++;                              // invalidate any late completion
   tuh_edpt_abort_xfer(s_dac.dev_addr, 0);
-  void (*next)(void) = s_timeout_next;
+  s_deferred_next = s_timeout_next;           // continue after ~2 frames
   s_timeout_next = NULL;
-  if (next) next();
+  s_deferred_at_ms = now + 20;
 }
 
 // Timeout / submit-failure continuations — same forward path the completion
@@ -332,6 +359,7 @@ static uint8_t s_fu_buf[2];
 static void fu_send_next(void);
 
 static void on_fu_step_complete(tuh_xfer_t *xfer) {
+  if (stale_completion(xfer)) return;
   disarm_step_watchdog();
   const uint8_t i = s_fu_step - 1;
   dlog("DSPico host: FU %u %s ch%u -> %s\n", s_dac.fu_id,
@@ -365,7 +393,7 @@ static void fu_send_next(void) {
       .setup = &req,
       .buffer = s_fu_buf,
       .complete_cb = on_fu_step_complete,
-      .user_data = 0,
+      .user_data = ++s_chain_gen,
   };
   if (tuh_control_xfer(&xfer)) {
     arm_step_watchdog(timeout_fu);
@@ -421,7 +449,7 @@ static void send_set_interface(void) {
       .setup = &req,
       .buffer = NULL,
       .complete_cb = on_set_alt_complete,
-      .user_data = 0,
+      .user_data = ++s_chain_gen,
   };
   if (tuh_control_xfer(&xfer)) {
     arm_step_watchdog(timeout_alt);
@@ -454,7 +482,7 @@ static void send_set_sample_rate_uac2(void) {
       .setup = &req,
       .buffer = s_freq_buf,
       .complete_cb = on_set_freq_complete,
-      .user_data = 0,
+      .user_data = ++s_chain_gen,
   };
   if (tuh_control_xfer(&xfer)) {
     arm_step_watchdog(timeout_rate);
@@ -486,7 +514,7 @@ static void send_set_sample_rate_uac1(void) {
       .setup = &req,
       .buffer = s_freq_buf,
       .complete_cb = on_set_freq_complete,
-      .user_data = 0,
+      .user_data = ++s_chain_gen,
   };
   if (tuh_control_xfer(&xfer)) {
     arm_step_watchdog(timeout_rate);
@@ -532,6 +560,7 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
 }
 
 static void on_set_alt_complete(tuh_xfer_t *xfer) {
+  if (stale_completion(xfer)) return;
   disarm_step_watchdog();
   dlog("DSPico host: SET_INTERFACE(itf %u, alt %u) -> %s\n",
          s_dac.as_itf, s_dac.as_alt,
@@ -549,6 +578,7 @@ static void on_set_alt_complete(tuh_xfer_t *xfer) {
 }
 
 static void on_set_freq_complete(tuh_xfer_t *xfer) {
+  if (stale_completion(xfer)) return;
   disarm_step_watchdog();
   // A DAC that only supports 48 kHz may STALL the set-rate request; that's
   // fine — its fixed rate is the one we want anyway. Log it either way.
@@ -637,6 +667,7 @@ static bool dac_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result,
 static void dac_close(uint8_t dev_addr) {
   if (dev_addr != s_dac.dev_addr) return;
   disarm_step_watchdog();
+  s_deferred_next = NULL;
   dlog("DSPico host: DAC disconnected\n");
   memset(&s_dac, 0, sizeof(s_dac));
 }

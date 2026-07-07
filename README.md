@@ -41,7 +41,7 @@ is pure on-core DSP and runs regardless.
 > (`.github/workflows/ci.yml` uploads the `.uf2`). Stock Pico-PIO-USB does
 > **not** implement isochronous OUT — its OUT path waits for a handshake that
 > iso never sends — so `setup.sh` pins the library to a known commit and applies
-> [`patches/0001-host-iso-out-no-handshake.patch`](patches/). The patched iso
+> [`patches/0001-iso-out-and-large-packets.patch`](patches/). The patched iso
 > path is spec-correct but **must still be validated on real hardware** (the
 > Phase 1b gate): desk analysis cannot prove the bit-banged timing holds.
 
