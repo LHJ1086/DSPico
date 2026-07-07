@@ -287,6 +287,7 @@ taking priority:
 | **cyan** | DAC attached, negotiation/setup in progress (should be brief) |
 | **green** | iso audio streaming to the DAC |
 | **red** | DAC attached but **incompatible** (no stereo 48 kHz PCM alt) or setup failed |
+| **purple-ish flicker (blue↔red)** | the DAC is **attach/detach looping** — it enumerates, fails, drops off the bus, and retries. Usually bus power sagging under load: use a **self-powered DAC or powered hub**, and check the device log for repeated `audio device attached` lines |
 
 **No sound to the DAC** — walk the LED:
 - **Blue with the DAC plugged in** → the DAC never enumerates. Check: right
@@ -295,8 +296,11 @@ taking priority:
   D+ pull-up removal per `docs/hardware-fix.md`; try a different cable
   (captive/Type-A-cabled DACs avoid Type-C CC issues).
 - **Red** → the DAC enumerated but offers no stereo 48 kHz 16/24-bit PCM alt,
-  or a setup step failed — the UART log (GPIO0, 115200) prints exactly which
-  step (`SET_INTERFACE`, sample rate, endpoint open) and the DAC's VID:PID.
+  or a setup step failed — the diagnostics print exactly which step
+  (`SET_INTERFACE`, sample rate, endpoint open), every format candidate seen,
+  and the DAC's VID:PID. **No UART adapter needed:** once the WebUSB
+  configurator connects it polls the device's log and shows these lines as
+  `[device] …` in its log panel (they also go to UART GPIO0 @115200).
 - **Cyan forever** → a setup control transfer is hanging; UART shows the last
   step reached.
 - **Green but silent** → the stream is running. The firmware now **unmutes the

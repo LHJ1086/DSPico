@@ -20,6 +20,7 @@
 #include "tusb.h"
 
 #include "board_config.h"
+#include "debug_log.h"
 #include "status_led.h"
 #include "uac2_device.h"
 #include "uac_host.h"
@@ -131,6 +132,7 @@ int main(void) {
   for (;;) {
     tud_task();
     config_usb_task();   // deferred flash commit (too slow for a USB callback)
+    dlog_task();         // forward core1 host diagnostics to UART + WebUSB log
 
     // Glanceable status, host side first (that's where bring-up problems
     // live): green = streaming, red = DAC attached but unusable/failed,

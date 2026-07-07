@@ -12,6 +12,7 @@
 
 #include "board_config.h"
 #include "crc32.h"
+#include "debug_log.h"
 #include "dsp_peq.h"
 #include "signal_path.h"
 #include "usb_descriptors.h"
@@ -25,6 +26,7 @@
 #define REQ_SET_BAND     0x04
 #define REQ_COMMIT       0x05
 #define REQ_RESET        0x06
+#define REQ_GET_LOG      0x07   // IN: drain buffered host-side diagnostics
 #define VENDOR_REQUEST_WEBUSB    0x21
 #define VENDOR_REQUEST_MICROSOFT 0x22
 #define WEBUSB_REQUEST_GET_URL   2
@@ -197,6 +199,15 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     case REQ_GET_STATE:
       if (stage != CONTROL_STAGE_SETUP) return true;
       return tud_control_xfer(rhport, request, s_state_buf, build_state(s_state_buf));
+
+    // --- App: drain the device's diagnostic log (host-side bring-up) --------
+    case REQ_GET_LOG: {
+      if (stage != CONTROL_STAGE_SETUP) return true;
+      static uint8_t logbuf[256];
+      const uint16_t want = request->wLength > sizeof(logbuf)
+                          ? (uint16_t) sizeof(logbuf) : request->wLength;
+      return tud_control_xfer(rhport, request, logbuf, dlog_usb_read(logbuf, want));
+    }
 
     // --- App: set pre-gain (f32 dB) -----------------------------------------
     case REQ_SET_PREGAIN:

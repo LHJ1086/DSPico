@@ -5,7 +5,7 @@
 // the big caveat: isochronous OUT over the bit-banged PIO port is unproven, so
 // treat this as the scaffold you iterate on with a logic analyzer.
 // ---------------------------------------------------------------------------
-#include <stdio.h>
+#include "debug_log.h"
 #include <string.h>
 
 #include "tusb.h"
@@ -89,7 +89,7 @@ static void consider_candidate(dac_dev_t *d, const alt_cand_t *c,
                                tusb_desc_endpoint_t const *ep) {
   // Log every candidate so an "incompatible" verdict is diagnosable from the
   // UART without a USB analyzer.
-  printf("DSPico host: alt itf %u.%u: ch=%u subslot=%u bits=%u pcm=%d rate48=%d maxpkt=%u\n",
+  dlog("DSPico host: alt itf %u.%u: ch=%u subslot=%u bits=%u pcm=%d rate48=%d maxpkt=%u\n",
          c->itf, c->alt, c->channels, c->subslot, c->bits,
          (int) c->pcm, (int) c->rate_ok, ep->wMaxPacketSize);
   if (!c->pcm || !c->rate_ok) return;
@@ -223,7 +223,7 @@ static bool dac_open(uint8_t rhport, uint8_t dev_addr,
   if (!s_dac.in_use) {
     uint16_t vid = 0, pid = 0;
     tuh_vid_pid_get(dev_addr, &vid, &pid);
-    printf("DSPico host: audio device attached (addr %u, VID:PID %04X:%04X)\n",
+    dlog("DSPico host: audio device attached (addr %u, VID:PID %04X:%04X)\n",
            dev_addr, vid, pid);
   }
   s_dac.in_use = true;
@@ -258,21 +258,29 @@ static bool setup_is_uac2(void) {
 // doesn't implement simply STALL; every step tolerates that and moves on.
 static void finish_setup(void);
 
-static const struct { uint8_t sel, ch, len; } s_fu_steps[] = {
-  { AUDIO_FU_CTRL_MUTE,   0, 1 }, { AUDIO_FU_CTRL_MUTE,   1, 1 },
-  { AUDIO_FU_CTRL_MUTE,   2, 1 },
-  { AUDIO_FU_CTRL_VOLUME, 0, 2 }, { AUDIO_FU_CTRL_VOLUME, 1, 2 },
-  { AUDIO_FU_CTRL_VOLUME, 2, 2 },
+// Volume target: a modest -12 dB (1/256 dB units) rather than 0 dB — audible
+// on every DAC, but doesn't slam a bus-powered amp to full output the moment
+// it unmutes (marginal VBUS + full amp draw can brown the dongle out into an
+// attach/detach loop). The OS volume on the PC side still scales the stream.
+#define FU_VOLUME_TARGET ((uint16_t)(int16_t)(-12 * 256))
+
+static const struct { uint8_t sel, ch, len; uint16_t val; } s_fu_steps[] = {
+  { AUDIO_FU_CTRL_MUTE,   0, 1, 0 },
+  { AUDIO_FU_CTRL_MUTE,   1, 1, 0 },
+  { AUDIO_FU_CTRL_MUTE,   2, 1, 0 },
+  { AUDIO_FU_CTRL_VOLUME, 0, 2, FU_VOLUME_TARGET },
+  { AUDIO_FU_CTRL_VOLUME, 1, 2, FU_VOLUME_TARGET },
+  { AUDIO_FU_CTRL_VOLUME, 2, 2, FU_VOLUME_TARGET },
 };
 static uint8_t s_fu_step;
-static uint8_t s_fu_buf[2];   // mute: {0}; volume: 0x0000 = 0.0 dB (1/256 dB units)
+static uint8_t s_fu_buf[2];
 
 static void fu_send_next(void);
 
 static void on_fu_step_complete(tuh_xfer_t *xfer) {
   const uint8_t i = s_fu_step - 1;
-  printf("DSPico host: FU %u %s ch%u -> %s\n", s_dac.fu_id,
-         s_fu_steps[i].sel == AUDIO_FU_CTRL_MUTE ? "unmute" : "vol 0dB",
+  dlog("DSPico host: FU %u %s ch%u -> %s\n", s_dac.fu_id,
+         s_fu_steps[i].sel == AUDIO_FU_CTRL_MUTE ? "unmute" : "vol -12dB",
          s_fu_steps[i].ch,
          xfer->result == XFER_RESULT_SUCCESS ? "OK" : "stalled (not implemented)");
   fu_send_next();
@@ -284,7 +292,8 @@ static void fu_send_next(void) {
     return;
   }
   const uint8_t i = s_fu_step++;
-  s_fu_buf[0] = 0; s_fu_buf[1] = 0;   // unmuted / 0.0 dB
+  s_fu_buf[0] = (uint8_t) (s_fu_steps[i].val & 0xFF);
+  s_fu_buf[1] = (uint8_t) (s_fu_steps[i].val >> 8);
 
   tusb_control_request_t const req = {
       .bmRequestType_bit = { .recipient = TUSB_REQ_RCPT_INTERFACE,
@@ -303,16 +312,21 @@ static void fu_send_next(void) {
       .complete_cb = on_fu_step_complete,
       .user_data = 0,
   };
-  tuh_control_xfer(&xfer);
+  if (!tuh_control_xfer(&xfer)) {
+    // Submit refused (control pipe busy/gone): don't strand the chain — the
+    // stream matters more than the volume preset.
+    dlog("DSPico host: FU step submit failed — skipping volume init\n");
+    finish_setup();
+  }
 }
 
 static void start_fu_init(void) {
   s_fu_step = 0;
   if (s_dac.fu_id) {
-    printf("DSPico host: initialising DAC Feature Unit %u (unmute + 0 dB)\n",
+    dlog("DSPico host: initialising DAC Feature Unit %u (unmute + vol -12 dB)\n",
            s_dac.fu_id);
   } else {
-    printf("DSPico host: no Feature Unit found — skipping volume init\n");
+    dlog("DSPico host: no Feature Unit found — skipping volume init\n");
   }
   fu_send_next();
 }
@@ -321,12 +335,12 @@ static void start_fu_init(void) {
 static void finish_setup(void) {
   if (tuh_edpt_open(s_dac.dev_addr, &s_dac.ep_out)) {
     s_dac.streaming = true;
-    printf("DSPico host: streaming started (EP 0x%02X, %u-byte subslot)\n",
+    dlog("DSPico host: streaming started (EP 0x%02X, %u-byte subslot)\n",
            s_dac.ep_out.bEndpointAddress, s_dac.subslot);
     submit_first_packet();
   } else {
     s_dac.incompatible = true;
-    printf("DSPico host: ERROR — tuh_edpt_open(0x%02X) failed\n",
+    dlog("DSPico host: ERROR — tuh_edpt_open(0x%02X) failed\n",
            s_dac.ep_out.bEndpointAddress);
   }
   usbh_driver_set_config_complete(s_dac.dev_addr, s_dac.as_itf);
@@ -415,13 +429,13 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
   if (!s_dac.have_as || itf_num != s_dac.as_itf) {
     if (!s_dac.have_as && itf_num == s_dac.ac_itf) {
       s_dac.incompatible = true;
-      printf("DSPico host: DAC has no stereo 48 kHz Type-I PCM alt (16/24-bit) — not streaming\n");
+      dlog("DSPico host: DAC has no stereo 48 kHz Type-I PCM alt (16/24-bit) — not streaming\n");
     }
     usbh_driver_set_config_complete(dev_addr, itf_num);
     return true;
   }
 
-  printf("DSPico host: DAC (UAC%c) itf %u alt %u — %u-bit in %u-byte subslot, EP 0x%02X maxpkt %u%s\n",
+  dlog("DSPico host: DAC (UAC%c) itf %u alt %u — %u-bit in %u-byte subslot, EP 0x%02X maxpkt %u%s\n",
          setup_is_uac2() ? '2' : '1',
          s_dac.as_itf, s_dac.as_alt, s_dac.bits, s_dac.subslot,
          s_dac.ep_out.bEndpointAddress, s_dac.ep_out.wMaxPacketSize,
@@ -445,7 +459,7 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
 }
 
 static void on_set_alt_complete(tuh_xfer_t *xfer) {
-  printf("DSPico host: SET_INTERFACE(itf %u, alt %u) -> %s\n",
+  dlog("DSPico host: SET_INTERFACE(itf %u, alt %u) -> %s\n",
          s_dac.as_itf, s_dac.as_alt,
          xfer->result == XFER_RESULT_SUCCESS ? "OK" : "FAILED");
   if (xfer->result != XFER_RESULT_SUCCESS) {
@@ -463,7 +477,7 @@ static void on_set_alt_complete(tuh_xfer_t *xfer) {
 static void on_set_freq_complete(tuh_xfer_t *xfer) {
   // A DAC that only supports 48 kHz may STALL the set-rate request; that's
   // fine — its fixed rate is the one we want anyway. Log it either way.
-  printf("DSPico host: SET sample rate 48000 -> %s\n",
+  dlog("DSPico host: SET sample rate 48000 -> %s\n",
          xfer->result == XFER_RESULT_SUCCESS ? "OK" : "stalled/failed (continuing)");
   if (setup_is_uac2()) {
     send_set_interface();          // UAC2: now activate the alt
@@ -528,7 +542,7 @@ static void on_iso_complete(tuh_xfer_t *xfer) {
   if (xfer->daddr != s_dac.dev_addr) return;
   static uint32_t pkts;
   if ((++pkts & 0x1FFF) == 0) {   // every 8192 packets ≈ 8 s
-    printf("DSPico host: streaming heartbeat — %lu iso packets sent\n",
+    dlog("DSPico host: streaming heartbeat — %lu iso packets sent\n",
            (unsigned long) pkts);
   }
   submit_packet();
@@ -544,7 +558,7 @@ static bool dac_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result,
 
 static void dac_close(uint8_t dev_addr) {
   if (dev_addr != s_dac.dev_addr) return;
-  printf("DSPico host: DAC disconnected\n");
+  dlog("DSPico host: DAC disconnected\n");
   memset(&s_dac, 0, sizeof(s_dac));
 }
 

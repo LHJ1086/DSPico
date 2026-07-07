@@ -13,6 +13,7 @@ const PROTO = {
   REQ_SET_BAND:   0x04,     // OUT : wIndex=idx, 16-byte band record
   REQ_COMMIT:     0x05,     // OUT : persist to flash
   REQ_RESET:      0x06,     // OUT : flat/defaults
+  REQ_GET_LOG:    0x07,     // IN  : drain the device's diagnostic log text
   MAGIC: 0x51505344,        // 'DSPQ' little-endian
 };
 
@@ -281,12 +282,26 @@ function connectHint(step, err){
   return lines.join('\n');
 }
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 async function connect(){
   if (!('usb' in navigator)) { log('WebUSB not available — use Chrome/Edge over https or localhost.', 'e'); return; }
   let step = 'requestDevice';
   try {
     usbDevice = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x1209, productId: 0xD590 }] });
-    step = 'open';           await usbDevice.open();
+    step = 'open';
+    // "An operation that changes interface state is in progress" /
+    // "The device was disconnected": a previous close() or an OS re-enumerate
+    // is still settling. Back off briefly and retry a couple of times before
+    // giving up — this makes replug + immediate Connect just work.
+    for (let attempt = 0; ; attempt++) {
+      try { await usbDevice.open(); break; }
+      catch (e) {
+        if (attempt >= 2 || (e.name !== 'InvalidStateError' && e.name !== 'NotFoundError')) throw e;
+        log(`open busy (${e.name}) — retrying…`);
+        await sleep(600);
+      }
+    }
     step = 'selectConfiguration';
     if (usbDevice.configuration === null) await usbDevice.selectConfiguration(1);
     step = 'claimInterface'; await usbDevice.claimInterface(PROTO.ITF_VENDOR);
@@ -296,14 +311,32 @@ async function connect(){
   } catch (err) {
     log(connectHint(step, err), 'e');
     setConnected(false);
+    try { if (usbDevice) await usbDevice.close(); } catch (_) {}
     usbDevice = null;
   }
+}
+
+// Poll the device's diagnostic log (host-side USB events: DAC attach, format
+// candidates, setup steps, heartbeats) so bring-up is debuggable in-browser.
+let logTimer = null;
+async function pollDeviceLog(){
+  if (!usbDevice) return;
+  try {
+    const d = await ctrlIn(PROTO.REQ_GET_LOG, 255);
+    if (d && d.byteLength) {
+      const text = new TextDecoder().decode(
+        d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
+      text.split('\n').filter(s => s.trim()).forEach(s => log('[device] ' + s));
+    }
+  } catch (_) { /* transient — next poll retries */ }
 }
 
 function setConnected(on){
   $('dot').classList.toggle('on', on);
   ['btnLoadDev','btnPushDev','btnCommit'].forEach(id=>$(id).disabled=!on);
   $('btnConnect').textContent = on ? 'Disconnect' : 'Connect device';
+  if (on && !logTimer) logTimer = setInterval(pollDeviceLog, 800);
+  if (!on && logTimer) { clearInterval(logTimer); logTimer = null; }
 }
 
 async function ctrlIn(request, length, index=PROTO.ITF_VENDOR){
@@ -393,7 +426,24 @@ $('btnAuto').onclick = ()=>{
   state.preGainDb = -Math.max(0,maxBoost); renderBands(); pushPreGain();
 };
 
-$('btnConnect').onclick = ()=>{ usbDevice ? (usbDevice.close(), usbDevice=null, setConnected(false), log('Disconnected.')) : connect(); };
+// Toggle connect/disconnect. Guards against double-clicks and always AWAITS
+// close() — an un-awaited close left "an operation in progress" that made the
+// next open() fail.
+let busy = false;
+$('btnConnect').onclick = async ()=>{
+  if (busy) return;
+  busy = true; $('btnConnect').disabled = true;
+  try {
+    if (usbDevice) {
+      const d = usbDevice; usbDevice = null;
+      setConnected(false);
+      try { await d.close(); } catch (_) {}
+      log('Disconnected.');
+    } else {
+      await connect();
+    }
+  } finally { busy = false; $('btnConnect').disabled = false; }
+};
 $('btnLoadDev').onclick = loadFromDevice;
 $('btnPushDev').onclick = pushBand;
 $('btnCommit').onclick  = async ()=>{ try{ await ctrlOut(PROTO.REQ_COMMIT); log('Saved to flash.'); }catch(e){ log('Commit failed: '+e.message,'e'); } };

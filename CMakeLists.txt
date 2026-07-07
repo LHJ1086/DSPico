@@ -38,6 +38,7 @@ add_executable(dspico
     src/dsp_peq.c
     src/signal_path.c
     src/config_usb.c
+    src/debug_log.c
     # TinyUSB <-> Pico-PIO-USB glue: provides the hcd_* host-controller driver
     # for rhport 1 (CFG_TUH_RPI_PIO_USB). The dcd_ half self-gates off — we use
     # the native controller for the device side. The pico-sdk does not create a
