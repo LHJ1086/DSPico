@@ -32,7 +32,10 @@ static tusb_desc_device_t const desc_device = {
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = USB_VID,
     .idProduct          = USB_PID,
-    .bcdDevice          = 0x0100,
+    // Windows caches the MS OS 2.0 / WinUSB binding per VID/PID/bcdDevice.
+    // Bump this whenever the descriptor layout or the vendor-interface driver
+    // story changes, or old (possibly failed) bindings stick forever.
+    .bcdDevice          = 0x0102,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x03,
@@ -62,6 +65,17 @@ uint8_t const *tud_descriptor_device_cb(void) {
    | (AUDIO_CTRL_RW << AUDIO_FEATURE_UNIT_CTRL_VOLUME_POS))
 
 #define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + DSPICO_UAC2_DESC_TOTAL_LEN + TUD_VENDOR_DESC_LEN)
+
+// String descriptor indices. Declared here (ahead of the configuration and
+// string tables that reference them) so STRID_VENDOR is visible where the
+// vendor interface descriptor names it.
+enum {
+  STRID_LANGID = 0,
+  STRID_MANUFACTURER,
+  STRID_PRODUCT,
+  STRID_SERIAL,
+  STRID_VENDOR,
+};
 
 static uint8_t const desc_configuration[] = {
     // Configuration header: 1 config, ITF_NUM_TOTAL interfaces, self-checked
@@ -140,7 +154,9 @@ static uint8_t const desc_configuration[] = {
                                 /*_lockdelay*/ 0x0000),
 
     // --- Isochronous feedback IN endpoint -----------------------------------
-    TUD_AUDIO_DESC_STD_AS_ISO_FB_EP(/*_ep*/ EPNUM_AUDIO_FB, /*_interval*/ 0x01),
+    // Full-speed async feedback carries a 3-byte (10.14) value; declare a 4-byte
+    // max packet (>= the FS minimum). The descriptor length is 7 regardless.
+    TUD_AUDIO_DESC_STD_AS_ISO_FB_EP(/*_ep*/ EPNUM_AUDIO_FB, /*_epsize*/ 4, /*_interval*/ 0x01),
 
     // --- Vendor interface: the WebUSB EQ config channel (brief §6b) ----------
     TUD_VENDOR_DESCRIPTOR(ITF_NUM_VENDOR, STRID_VENDOR, EPNUM_VENDOR_OUT, EPNUM_VENDOR_IN, 64),
@@ -157,16 +173,8 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
 }
 
 // ---------------------------------------------------------------------------
-// String descriptors
+// String descriptors  (indices defined in the STRID enum above)
 // ---------------------------------------------------------------------------
-enum {
-  STRID_LANGID = 0,
-  STRID_MANUFACTURER,
-  STRID_PRODUCT,
-  STRID_SERIAL,
-  STRID_VENDOR,
-};
-
 static char const *string_desc_arr[] = {
     (const char[]){0x09, 0x04},  // 0: supported language = English (0x0409)
     "DSPico",                    // 1: Manufacturer

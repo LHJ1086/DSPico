@@ -1,9 +1,15 @@
 // ---------------------------------------------------------------------------
-// DSPico — board configuration for the Waveshare RP2350-USB-CM
+// DSPico — board configuration for the Waveshare RP2350-USB-C / RP2350-USB-CM
 //
 // All hardware-specific facts (pins, clock, USB roles) live here so the rest of
 // the firmware never hard-codes a magic pin number. Values are taken from the
-// board schematic as summarised in the build brief (§2, §4, §8).
+// board schematics.
+//
+// The two variants are identical EXCEPT the PIO-USB port: their D+/D- GPIO
+// assignments are swapped (verified on the RP2350-USB-C schematic: GPIO12 ->
+// 27R -> DB_P/D+, GPIO13 -> 27R -> DB_N/D-, and the populated 1.5k D+ pull-up
+// R13 sits on the GPIO12 net). Default build = RP2350-USB-C; configure with
+// -DDSPICO_BOARD_USB_CM=ON for the -CM variant.
 // ---------------------------------------------------------------------------
 #ifndef DSPICO_BOARD_CONFIG_H
 #define DSPICO_BOARD_CONFIG_H
@@ -20,17 +26,29 @@
 #define DSPICO_RHPORT_DEVICE 0
 #define DSPICO_RHPORT_HOST   1
 
-// --- PIO-USB data pins (Type-C2) -------------------------------------------
-// The schematic wires D- = GPIO12 and D+ = GPIO13 (same on the -C and -CM
-// variants). Pico-PIO-USB's config takes the D+ pin and assumes D- = D+ + 1 by
-// default (ascending). This board has the pins REVERSED (D+ is the higher pin),
-// so we must set D+ = GPIO13 and enable the DP/DM swap so the library drives the
-// correct polarity (brief §3b). Note: the ~1.5 kOhm D+ pull-up may need
-// removing for host mode — see docs/hardware-fix.md (net, not label: it is R13
-// on RP2350-USB-C, R10 on RP2350-USB-CM).
-#define DSPICO_PIO_USB_DP_PIN 13   // GPIO13 = D+
-// D- is DP-1 = GPIO12 once the swap flag below is applied.
-#define DSPICO_PIO_USB_PINOUT_DPDM_SWAP 1
+// --- PIO-USB data pins (Type-C2) — VARIANT-SPECIFIC --------------------------
+// The D+/D- GPIO assignment is SWAPPED between the two board variants:
+//
+//   RP2350-USB-C  (default):  D+ = GPIO12,  D- = GPIO13   (DPDM, no swap)
+//   RP2350-USB-CM (-DDSPICO_BOARD_USB_CM=ON): D+ = GPIO13, D- = GPIO12 (DMDP)
+//
+// Pico-PIO-USB's config takes the D+ pin; the swap flag selects whether D- is
+// DP+1 (DPDM) or DP-1 (DMDP). Getting this wrong drives the bus with inverted
+// polarity and the downstream DAC will never enumerate — flash the right
+// variant before suspecting hardware. Note: the ~1.5 kOhm D+ pull-up may need
+// removing for host mode — see docs/hardware-fix.md (trust the net, not the
+// label: the populated part is R13 on -C, R10 on -CM, always D+ -> 3V3).
+#ifndef DSPICO_BOARD_USB_CM
+#define DSPICO_BOARD_USB_CM 0
+#endif
+
+#if DSPICO_BOARD_USB_CM
+#define DSPICO_PIO_USB_DP_PIN 13            // -CM: GPIO13 = D+
+#define DSPICO_PIO_USB_PINOUT_DPDM_SWAP 1   //      D- = DP-1 = GPIO12 (DMDP)
+#else
+#define DSPICO_PIO_USB_DP_PIN 12            // -C:  GPIO12 = D+
+#define DSPICO_PIO_USB_PINOUT_DPDM_SWAP 0   //      D- = DP+1 = GPIO13 (DPDM)
+#endif
 
 // --- Status LED (brief §2) -------------------------------------------------
 // WS2812B (NeoPixel) on GPIO16. Single pixel used as a coarse state indicator.

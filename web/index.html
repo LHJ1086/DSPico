@@ -134,11 +134,18 @@
   </div>
 
   <div class="panel">
-    <h2>Log</h2>
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2 style="margin:0">Log</h2>
+      <div class="cluster">
+        <button id="btnCopyLog">Copy log</button>
+        <button id="btnClearLog">Clear</button>
+      </div>
+    </div>
     <pre id="log"></pre>
   </div>
 </main>
 
-<script src="dspico.js"></script>
+<!-- cache-buster: keep ?v= in sync with APP_REV in dspico.js -->
+<script src="dspico.js?v=r10"></script>
 </body>
 </html>

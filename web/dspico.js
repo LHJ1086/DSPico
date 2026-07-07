@@ -4,6 +4,10 @@
 // ===========================================================================
 'use strict';
 
+// Bumped on every configurator change and printed in the Ready line, so a
+// stale/cached deployment is immediately visible in any pasted log.
+const APP_REV = 'r10';
+
 // --- Shared protocol contract (keep in sync with the firmware) --------------
 const PROTO = {
   ITF_VENDOR: 2,            // vendor interface number in the composite device
@@ -13,6 +17,7 @@ const PROTO = {
   REQ_SET_BAND:   0x04,     // OUT : wIndex=idx, 16-byte band record
   REQ_COMMIT:     0x05,     // OUT : persist to flash
   REQ_RESET:      0x06,     // OUT : flat/defaults
+  REQ_GET_LOG:    0x07,     // IN  : drain the device's diagnostic log text
   MAGIC: 0x51505344,        // 'DSPQ' little-endian
 };
 
@@ -110,7 +115,9 @@ function parseAutoEq(text, maxBands = MAX_BANDS) {
 
 // ===========================================================================
 // Response curve — RBJ biquad magnitude (matches the device's per-band design
-// closely, and matches what AutoEQ assumes). For display only.
+// closely, and matches what AutoEQ assumes). DISPLAY-ONLY approximation: the
+// device itself runs a TPT state-variable filter (src/dsp_peq.c), which is
+// audibly identical but stays accurate at frequency extremes.
 // ===========================================================================
 function rbjCoeffs(band, fs) {
   const A = Math.pow(10, band.gain / 40);
@@ -203,7 +210,8 @@ function updateAutoHint(){
     if (b.enabled && b.gain > maxBoost &&
         (b.type===TYPE.PEAKING||b.type===TYPE.LOWSHELF||b.type===TYPE.HIGHSHELF))
       maxBoost = b.gain;
-  $('autoHint').textContent = maxBoost>0 ? `suggested: ${(-maxBoost).toFixed(1)} dB` : 'no boosts';
+  // Heuristic: covers the single largest boost; overlapping boosts can sum higher.
+  $('autoHint').textContent = maxBoost>0 ? `suggested (max band): ${(-maxBoost).toFixed(1)} dB` : 'no boosts';
 }
 
 // ---- Frequency-response graph ---------------------------------------------
@@ -257,23 +265,140 @@ function onTableInput(e){
 // ===========================================================================
 // WebUSB
 // ===========================================================================
-async function connect(){
+// Map a failed connect step + error onto something actionable. The usual
+// culprits are OS driver/permission issues, not the device itself.
+function connectHint(step, err){
+  const lines = [`Connect failed at ${step}: ${err.name}: ${err.message}`];
+  if (step === 'open' || step === 'claimInterface') {
+    lines.push('Hints:');
+    lines.push(' • Windows: the WinUSB driver may not be bound to the config interface.');
+    lines.push('   Unplug/replug the device (this firmware bumps bcdDevice so Windows');
+    lines.push('   re-reads the driver descriptors). If it still fails: Device Manager →');
+    lines.push('   find the DSPico entry → Uninstall device (tick "delete driver") → replug.');
+    lines.push(' • Linux: your user needs rw access to the USB node. Install the udev rule:');
+    lines.push('   sudo cp docs/99-dspico.rules /etc/udev/rules.d/ && sudo udevadm control --reload');
+    lines.push('   then replug the device.');
+    lines.push(' • Close other tabs/apps that may hold the device open.');
+  } else if (step === 'readInfo') {
+    lines.push('The interface was claimed but the device did not answer the INFO request —');
+    lines.push('likely an old firmware on the device. Reflash the current dspico.uf2.');
+  }
+  if (err.name === 'TimeoutError') {
+    lines.push('A USB operation hung — usually the OS re-enumerating the device mid-call.');
+    lines.push('Unplug the DSPico, wait 3 seconds, replug, and let the page auto-connect.');
+  }
+  return lines.join('\n');
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const DSPICO_FILTER = { vendorId: 0x1209, productId: 0xD590 };
+
+// Every USB await is time-boxed: a hung promise (device re-enumerating mid
+// operation) must fail loudly and release the connect guard, never wedge the
+// page into a state where clicking Connect does nothing.
+function withTimeout(promise, ms, what){
+  let t;
+  const killer = new Promise((_, rej) => {
+    t = setTimeout(() => rej(Object.assign(
+      new Error(`${what} timed out after ${ms} ms — the device stopped responding (replug and retry)`),
+      { name: 'TimeoutError' })), ms);
+  });
+  return Promise.race([promise, killer]).finally(() => clearTimeout(t));
+}
+
+// A device object already granted permission (no chooser needed), or null.
+async function getPermittedDevice(){
+  const devs = await navigator.usb.getDevices();
+  return devs.find(d => d.vendorId === DSPICO_FILTER.vendorId &&
+                        d.productId === DSPICO_FILTER.productId) || null;
+}
+
+// Open with recovery. "An operation that changes interface state is in
+// progress" / "device disconnected" mean a stale handle or an OS
+// re-enumeration mid-flight: back off, fetch a FRESH device object from
+// getDevices() (the old object can be permanently poisoned), and try again.
+async function openWithRetry(dev){
+  for (let attempt = 0; ; attempt++) {
+    try { await withTimeout(dev.open(), 3000, 'open'); return dev; }
+    catch (e) {
+      const transient = e.name === 'InvalidStateError' || e.name === 'NotFoundError' ||
+                        e.name === 'TimeoutError' || /disconnected|in progress/i.test(e.message);
+      if (attempt >= 4 || !transient) throw e;
+      log(`open busy (${e.name}), retry ${attempt + 1}/4…`);
+      try { await withTimeout(dev.close(), 1000, 'close'); } catch (_) {}
+      await sleep(700);
+      const fresh = await getPermittedDevice();
+      if (fresh) dev = fresh;
+    }
+  }
+}
+
+// interactive=true shows the chooser; false silently uses an already
+// permitted device (auto-connect on load / on replug).
+let connectInFlight = false;
+async function connect(interactive = true){
   if (!('usb' in navigator)) { log('WebUSB not available — use Chrome/Edge over https or localhost.', 'e'); return; }
+  if (connectInFlight) { log('(connect already in progress — ignored)'); return; }
+  if (usbDevice)       { log('(already connected)'); return; }
+  connectInFlight = true;
+  let step = 'requestDevice';
   try {
-    usbDevice = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x1209, productId: 0xD590 }] });
-    await usbDevice.open();
-    if (usbDevice.configuration === null) await usbDevice.selectConfiguration(1);
-    await usbDevice.claimInterface(PROTO.ITF_VENDOR);
-    await readInfo();
+    // After a replug, Windows can spend several seconds re-binding drivers,
+    // during which the device is invisible to the browser. Auto-connect polls
+    // patiently; the manual path checks once then falls back to the chooser.
+    let dev = await getPermittedDevice();
+    for (let i = 0; !dev && !interactive && i < 8; i++) {
+      await sleep(1200);
+      dev = await getPermittedDevice();
+    }
+    if (!dev) {
+      if (!interactive) {
+        log('DSPico not visible to the browser (drivers still installing?) — click "Connect device" to retry.');
+        return;
+      }
+      dev = await navigator.usb.requestDevice({ filters: [DSPICO_FILTER] });
+    }
+    step = 'open';           usbDevice = await openWithRetry(dev);
+    step = 'selectConfiguration';
+    if (usbDevice.configuration === null)
+      await withTimeout(usbDevice.selectConfiguration(1), 3000, 'selectConfiguration');
+    step = 'claimInterface';
+    await withTimeout(usbDevice.claimInterface(PROTO.ITF_VENDOR), 3000, 'claimInterface');
+    step = 'readInfo';
+    await withTimeout(readInfo(), 3000, 'readInfo');
     setConnected(true);
     log('Connected.');
-  } catch (err) { log('Connect failed: ' + err.message, 'e'); setConnected(false); }
+  } catch (err) {
+    log(connectHint(step, err), 'e');
+    setConnected(false);
+    try { if (usbDevice) await withTimeout(usbDevice.close(), 1000, 'close'); } catch (_) {}
+    usbDevice = null;
+  } finally {
+    connectInFlight = false;
+  }
+}
+
+// Poll the device's diagnostic log (host-side USB events: DAC attach, format
+// candidates, setup steps, heartbeats) so bring-up is debuggable in-browser.
+let logTimer = null;
+async function pollDeviceLog(){
+  if (!usbDevice) return;
+  try {
+    const d = await ctrlIn(PROTO.REQ_GET_LOG, 255);
+    if (d && d.byteLength) {
+      const text = new TextDecoder().decode(
+        d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
+      text.split('\n').filter(s => s.trim()).forEach(s => log('[device] ' + s));
+    }
+  } catch (_) { /* transient — next poll retries */ }
 }
 
 function setConnected(on){
   $('dot').classList.toggle('on', on);
   ['btnLoadDev','btnPushDev','btnCommit'].forEach(id=>$(id).disabled=!on);
   $('btnConnect').textContent = on ? 'Disconnect' : 'Connect device';
+  if (on && !logTimer) logTimer = setInterval(pollDeviceLog, 800);
+  if (!on && logTimer) { clearInterval(logTimer); logTimer = null; }
 }
 
 async function ctrlIn(request, length, index=PROTO.ITF_VENDOR){
@@ -289,13 +414,19 @@ async function ctrlOut(request, data=new ArrayBuffer(0), index=PROTO.ITF_VENDOR)
 }
 
 async function readInfo(){
-  const d = await ctrlIn(PROTO.REQ_INFO, 12);
+  const d = await ctrlIn(PROTO.REQ_INFO, 16);
   const magic = d.getUint32(0, true);
   if (magic !== PROTO.MAGIC) { log('Warning: unexpected device magic 0x'+magic.toString(16), 'e'); }
   const version = d.getUint16(4, true);
   MAX_BANDS   = d.getUint8(6);
   SAMPLE_RATE = d.getUint32(8, true);
-  $('devinfo').textContent = `DSPico v${version} · ${MAX_BANDS} bands · ${SAMPLE_RATE/1000|0}kHz`;
+  let uptime = '';
+  if (d.byteLength >= 16) {                      // newer firmware reports uptime
+    const up = d.getUint32(12, true);
+    uptime = ` · up ${up}s`;
+    log(`Device uptime: ${up} s${up < 30 ? '  ← very recent boot; if this stays small the board is RESETTING (check power / see the boot lines in this log)' : ''}`);
+  }
+  $('devinfo').textContent = `DSPico v${version} · ${MAX_BANDS} bands · ${SAMPLE_RATE/1000|0}kHz${uptime}`;
 }
 
 function packBand(b){
@@ -363,7 +494,24 @@ $('btnAuto').onclick = ()=>{
   state.preGainDb = -Math.max(0,maxBoost); renderBands(); pushPreGain();
 };
 
-$('btnConnect').onclick = ()=>{ usbDevice ? (usbDevice.close(), usbDevice=null, setConnected(false), log('Disconnected.')) : connect(); };
+// Toggle connect/disconnect. Guards against double-clicks and always AWAITS
+// close() — an un-awaited close left "an operation in progress" that made the
+// next open() fail.
+let busy = false;
+$('btnConnect').onclick = async ()=>{
+  if (busy) return;
+  busy = true; $('btnConnect').disabled = true;
+  try {
+    if (usbDevice) {
+      const d = usbDevice; usbDevice = null;
+      setConnected(false);
+      try { await d.close(); } catch (_) {}
+      log('Disconnected.');
+    } else {
+      await connect();
+    }
+  } finally { busy = false; $('btnConnect').disabled = false; }
+};
 $('btnLoadDev').onclick = loadFromDevice;
 $('btnPushDev').onclick = pushBand;
 $('btnCommit').onclick  = async ()=>{ try{ await ctrlOut(PROTO.REQ_COMMIT); log('Saved to flash.'); }catch(e){ log('Commit failed: '+e.message,'e'); } };
@@ -397,10 +545,44 @@ $('btnExport').onclick = ()=>{
   a.download='dspico-preset.json'; a.click(); URL.revokeObjectURL(a.href);
 };
 
+// ---- Log utilities -----------------------------------------------------
+$('btnCopyLog').onclick = async ()=>{
+  try { await navigator.clipboard.writeText($('log').textContent); log('Log copied to clipboard.'); }
+  catch (e) { log('Copy failed: ' + e.message, 'e'); }
+};
+$('btnClearLog').onclick = ()=>{ $('log').textContent = ''; };
+
+// ---- Plug/unplug awareness + auto-connect --------------------------------
+if ('usb' in navigator) {
+  navigator.usb.addEventListener('disconnect', (e)=>{
+    if (usbDevice && e.device === usbDevice) {
+      usbDevice = null;
+      setConnected(false);
+      log('Device unplugged.');
+    }
+  });
+  navigator.usb.addEventListener('connect', (e)=>{
+    if (!usbDevice &&
+        e.device.vendorId === DSPICO_FILTER.vendorId &&
+        e.device.productId === DSPICO_FILTER.productId) {
+      log('DSPico plugged in — connecting…');
+      connect(false);            // polls while the OS finishes driver binding
+    }
+  });
+}
+
 // Seed with a couple of example bands so the graph isn't empty.
 state.bands = [ newBand({type:TYPE.LOWSHELF, fc:105, gain:4, q:0.7}),
                 newBand({type:TYPE.PEAKING, fc:3000, gain:-3, q:1.5}) ];
 renderBands();
-log('Ready. Design offline, or Connect a DSPico to push live.');
+{
+  const chrome = (navigator.userAgent.match(/(Chrome|Edg)\/[\d.]+/g) || []).join(' ');
+  log(`Ready — configurator ${APP_REV} · ${navigator.platform || '?'} · ${chrome || navigator.userAgent.slice(0, 40)}`);
+  log('Design offline, or Connect a DSPico to push live.');
+}
+
+// Reconnect silently if this browser already has permission for a DSPico.
+getPermittedDevice().then(d => { if (d) { log('Found permitted DSPico — auto-connecting…'); connect(false); } })
+                    .catch(()=>{});
 
 } // end browser-only block

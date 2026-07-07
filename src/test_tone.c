@@ -44,5 +44,5 @@ size_t test_tone_fill(uint8_t *dst, size_t frames) {
     s_phase += s_phase_inc;
     if (s_phase >= 2.0f * (float) M_PI) s_phase -= 2.0f * (float) M_PI;
   }
-  return frames * 6;
+  return frames;   // frames, not bytes — same unit as signal_path_pull_play()
 }

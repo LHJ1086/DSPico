@@ -1,6 +1,7 @@
 # DSPico
 
-Inline digital **parametric-EQ USB bridge** for the Waveshare **RP2350-USB-CM**.
+Inline digital **parametric-EQ USB bridge** for the Waveshare **RP2350-USB-C**
+(default) / **RP2350-USB-CM** (`-DDSPICO_BOARD_USB_CM=ON`).
 
 ```
 PC / phone ──USB──► [ DSPico = RP2350 ] ──USB──► USB DAC
@@ -30,16 +31,19 @@ is pure on-core DSP and runs regardless.
 | **On-device parametric EQ** — N-band stereo SVF, 1 Hz–20 kHz, ±12 dB, Q 0.1–10, pre-gain, host-volume | ✅ implemented + **unit-tested** | `src/dsp_peq.*` |
 | **Signal path** — PC audio → pre-gain → PEQ → host volume → cross-core ring → DAC | ✅ implemented + **unit-tested** | `src/signal_path.*`, `src/audio_ring.h` |
 | **WebUSB configurator** — browser app + device vendor protocol, AutoEQ import, flash-persisted presets | ✅ implemented (app **unit-tested**) | `web/`, `src/config_usb.c` |
-| PIO **host** streams iso OUT to a DAC (test tone when idle) | ⚠️ **needs the hardware gate** | `src/uac_host.c`, `src/test_tone.c` |
+| **DAC format negotiation** — picks the DAC's stereo 48 kHz Type-I PCM alt; 24-bit preferred, 16-bit fallback (truncated) | ✅ implemented | `src/uac_host.c` |
+| **Iso OUT over PIO-USB** — carried patch teaches Pico-PIO-USB isochronous OUT (no-handshake per spec) | ✅ implemented, ⚠️ **needs the hardware gate** | `patches/`, `src/uac_host.c` |
 | Clock-domain feedback tuning; hot-plug/suspend robustness | ⛔ not yet (Phase 4/5) | — |
 
 > Honesty note: the **DSP and signal-path code is verified** — compiled with the
-> native compiler and checked numerically (see *Verifying the DSP* below). The
-> **USB-glue code could not be compiled here** (this environment can't fetch the
-> Pico SDK / TinyUSB / Pico-PIO-USB). It targets the TinyUSB in **Pico SDK 2.1.1**
-> and Pico-PIO-USB `master`; expect to iron out version-specific macro details at
-> first compile, and note the iso-over-PIO path in `uac_host.c` is the
-> experimental risk.
+> native compiler and checked numerically (see *Verifying the DSP* below), and
+> the **full firmware cross-compiles in CI** against Pico SDK **2.1.1**
+> (`.github/workflows/ci.yml` uploads the `.uf2`). Stock Pico-PIO-USB does
+> **not** implement isochronous OUT — its OUT path waits for a handshake that
+> iso never sends — so `setup.sh` pins the library to a known commit and applies
+> [`patches/0001-iso-out-and-large-packets.patch`](patches/). The patched iso
+> path is spec-correct but **must still be validated on real hardware** (the
+> Phase 1b gate): desk analysis cannot prove the bit-banged timing holds.
 
 ---
 
@@ -55,7 +59,8 @@ which fights the DAC's pull-up and corrupts the idle line when we act as host.
 1. If (and only if) host enumeration fails: **remove the 1.5 kΩ D+ pull-up.**
    Waveshare swaps this resistor's designator between board variants, so
    **trust the net, not the label** — remove whichever ~1.5 kΩ part sits between
-   the Type-C2 **D+ (GPIO13)** line and **3V3**, after confirming with a meter:
+   the Type-C2 **D+ net** (**GPIO12 on -C**, **GPIO13 on -CM**) and **3V3**,
+   after confirming with a meter:
 
    | Board variant | 1.5 kΩ D+ pull-up to remove | Empty footprint |
    |---------------|-----------------------------|-----------------|
@@ -68,9 +73,13 @@ which fights the DAC's pull-up and corrupts the idle line when we act as host.
    A **captive or Type-A-cabled** DAC also avoids Type-C CC negotiation issues.
 4. Leave the 27 Ω series resistors and the CC pull-downs alone — they're correct.
 
-The firmware already handles the reversed pin order (D− = GPIO12, D+ = GPIO13)
-via `DSPICO_PIO_USB_PINOUT_DPDM_SWAP` in `src/board_config.h` — this is config,
-not a solder fix, and is identical for both the -C and -CM variants.
+⚠️ **The D+/D− GPIO assignment is SWAPPED between the two variants** (verified
+on the -C schematic): **-C: D+ = GPIO12, D− = GPIO13**; **-CM: D+ = GPIO13,
+D− = GPIO12**. The firmware selects the right pinout at build time via
+`DSPICO_BOARD_USB_CM` in `src/board_config.h` (default **-C**; configure with
+`-DDSPICO_BOARD_USB_CM=ON` for -CM). This is config, not a solder fix — but
+flashing the wrong variant's build means the DAC will **never** enumerate, so
+check this before suspecting the resistor mod.
 
 ---
 
@@ -84,7 +93,7 @@ not a solder fix, and is identical for both the -C and -CM variants.
 | **Git** | any | fetch the SDK + Pico-PIO-USB |
 | **Python** | 3.x | SDK helper scripts + `picotool` build |
 | **Pico SDK** | **2.0.0** (2.1.1 recommended) | RP2350 support (bundles TinyUSB) |
-| **Pico-PIO-USB** | `master` | the second (host) USB port — fetched by `setup.sh` |
+| **Pico-PIO-USB** | pinned commit (see `setup.sh`) | the second (host) USB port — fetched **and patched** by `setup.sh` |
 | `libusb-1.0` dev headers | any | needed to build `picotool` (which the SDK builds) |
 
 > RP2350 support only exists in Pico SDK **≥ 2.0.0** — an older SDK will fail.
@@ -172,12 +181,11 @@ From the repository root:
 ```
 
 This clones **Pico-PIO-USB** into `lib/Pico-PIO-USB` (the only vendored
-dependency; the SDK provides everything else). Re-running it is safe. If you
-prefer to do it by hand:
-
-```bash
-git clone --depth 1 https://github.com/sekigon-gonnoc/Pico-PIO-USB lib/Pico-PIO-USB
-```
+dependency; the SDK provides everything else), pins it to a known-good commit,
+and applies this repo's patches from [`patches/`](patches/) — currently the
+**isochronous-OUT host support** the audio path requires (stock Pico-PIO-USB
+waits for a handshake that iso transfers never send). Re-running it is safe;
+don't clone the library by hand or you'll miss the patch.
 
 ---
 
@@ -192,6 +200,17 @@ cmake --build build -j
 The first configure builds `picotool` and generates `ws2812.pio.h` from the PIO
 source — both automatic. A clean rebuild is `rm -rf build` then re-run the two
 commands.
+
+> **Flash size:** the build sets `PICO_FLASH_SIZE_BYTES` to **2 MB** (W25Q16
+> per the board schematic), overriding the generic `pico2` board's 4 MB
+> assumption. This matters because the EQ preset is persisted in the **last**
+> flash sector. If your board carries a different part, adjust the definition
+> in `CMakeLists.txt`.
+>
+> **Board variant:** the default build targets the **RP2350-USB-C**. For the
+> **RP2350-USB-CM** add `-DDSPICO_BOARD_USB_CM=ON` to the configure step — the
+> two variants have their PIO-USB D+/D− pins swapped and the wrong build will
+> not enumerate the DAC.
 
 ---
 
@@ -255,11 +274,71 @@ screen /dev/tty.usbserial-XXXX 115200
 
 ---
 
+## First-boot troubleshooting (read the LED first)
+
+The status LED (WS2812 on GPIO16) tells you which half is stuck, host side
+taking priority:
+
+| Colour | Meaning |
+|--------|---------|
+| dim white | booting |
+| **amber** | nothing usable on either port — no DAC detected on Type-C2 |
+| **blue** | PC enumerated us; **no DAC seen** on the host port |
+| **cyan** | DAC attached, negotiation/setup in progress (should be brief) |
+| **green** | iso audio streaming to the DAC |
+| **red** | DAC attached but **incompatible** (no stereo 48 kHz PCM alt) or setup failed |
+| **purple-ish flicker (blue↔red)** | the DAC is **attach/detach looping** — it enumerates, fails, drops off the bus, and retries. Usually bus power sagging under load: use a **self-powered DAC or powered hub**, and check the device log for repeated `audio device attached` lines |
+
+**No sound to the DAC** — walk the LED:
+- **Blue with the DAC plugged in** → the DAC never enumerates. Check: right
+  board-variant build flashed? (-C vs -CM pins are swapped — see *Hardware
+  mods*); self-powered DAC (the PIO port has no VBUS management); try the
+  D+ pull-up removal per `docs/hardware-fix.md`; try a different cable
+  (captive/Type-A-cabled DACs avoid Type-C CC issues).
+- **Red** → the DAC enumerated but offers no stereo 48 kHz 16/24-bit PCM alt,
+  or a setup step failed — the diagnostics print exactly which step
+  (`SET_INTERFACE`, sample rate, endpoint open), every format candidate seen,
+  and the DAC's VID:PID. **No UART adapter needed:** once the WebUSB
+  configurator connects it polls the device's log and shows these lines as
+  `[device] …` in its log panel (they also go to UART GPIO0 @115200).
+- **Cyan forever** → a setup control transfer is hanging; UART shows the last
+  step reached.
+- **Green but silent** → the stream is running. The firmware now **unmutes the
+  DAC's own Feature Unit and sets it to 0 dB** after setup (some DACs power up
+  muted and real hosts always do this — the UART shows each `FU … unmute/vol`
+  step). If it's still silent: check the PC actually plays to "DSPico EQ
+  Bridge" and the OS volume/mute, then suspect iso data timing (the Phase 1b
+  analyzer check below).
+- **Blue with a Type-C DAC dongle** → try **flipping the Type-C plug 180°**
+  or a USB-A adapter: the port's CC resistors are orientation-asymmetric, so
+  some dongles only detect a source one way up. A captive/Type-A-cabled DAC
+  avoids this entirely.
+
+**WebUSB configurator won't connect** (the page's log panel names the failing
+step and prints hints):
+- **Windows:** the WinUSB driver must bind to the config interface via the
+  MS OS 2.0 descriptor, and Windows **caches** that per firmware version. This
+  firmware bumps the device version so a replug re-reads it; if it still
+  fails, open Device Manager → find the DSPico entry → *Uninstall device*
+  (tick "delete driver") → replug.
+- **Linux:** Chrome needs rw access to the USB node:
+  `sudo cp docs/99-dspico.rules /etc/udev/rules.d/ && sudo udevadm control --reload`,
+  then replug.
+- **"The device was disconnected" during connect** → the handle went stale
+  (Windows re-enumerates the device right after (re)binding its driver).
+  Just click **Connect again** — the current page recovers cleanly and
+  retries; make sure you're on the up-to-date configurator (redeploy Pages
+  after updating `web/`, or serve it locally).
+- Works only in **Chrome/Edge/Chromium** over **https or localhost**, and the
+  device must not be held open by another tab or app.
+
+---
+
 ## Running the go/no-go gates (human-in-the-loop)
 
 **Phase 0 sanity** — on power-up the status LED (WS2812 on GPIO16) shows:
-white (boot) → then amber (searching for DAC) / blue (enumerated by PC) /
-green (streaming to DAC).
+white (boot) → then amber/blue (no DAC) → cyan (DAC negotiating) →
+green (streaming to DAC); red = incompatible DAC (see the table above).
 
 **Phase 1a — device** (Type-C1 → PC):
 - The OS lists **"DSPico EQ Bridge"** as a selectable **output** device.
@@ -278,12 +357,47 @@ green (streaming to DAC).
 
 ---
 
+## Runtime behavior (stability rules baked into the firmware)
+
+- **DAC format negotiation** — on enumeration the host driver reads the DAC's
+  descriptors and picks a **stereo 48 kHz Type-I PCM** alternate setting:
+  **24-bit (3-byte subslot) preferred**, with a **16-bit fallback** (samples
+  truncated to their top 16 bits). A DAC offering neither is rejected with a
+  clear UART message instead of being fed garbage. The choice is logged on the
+  debug UART (`DSPico host: DAC itf … alt …`).
+- **Priming** — playback toward the DAC starts only after ~8 ms of audio is
+  buffered (`SIGNAL_PATH_PRIME_BYTES`), so a stream opens with a cushion
+  instead of stuttering on scheduling jitter; an underrun silently re-primes.
+- **Underrun = silence, not tone** — while the PC is streaming, any gap is
+  filled with silence. The 1 kHz test tone plays only when *no* PC stream is
+  active (bench/gate mode).
+- **Overflow drops whole frames** — if the PC sends while no DAC drains, the
+  cross-core ring drops complete frames (newest first) and never shifts the
+  producer/consumer frame alignment (regression-tested in `tests/path_test.c`).
+- **Stream restarts flush stale audio** — (re)starting the PC stream discards
+  whatever tail the previous stream left in the ring.
+- **Click-free volume** — the applied host gain slews toward the OS volume
+  target per sample (full scale in ~5 ms), so volume steps and mute never
+  click; a config **reset snaps** the gain so it can't ramp through the wrong
+  loudness. 0 dB bands are skipped outright (output-identical, cycles saved).
+- **CRC-protected presets** — the flash blob carries a CRC-32 over its payload;
+  a torn write (power loss mid-commit) is rejected at boot and the device
+  starts flat instead of loading garbage coefficients. Commits are also
+  deferred out of the USB control callback (ACK first, write from the main
+  loop) so a commit can't stall enumeration.
+- **FPU flush-to-zero** — both cores run with FZ+DN set, so decaying filter
+  state can't drag the M33 FPU through denormal territory during silence and
+  spike the DSP time.
+
+---
+
 ## Project layout
 
 ```
 CMakeLists.txt          top-level build (SDK + Pico-PIO-USB + pioasm for LED)
 pico_sdk_import.cmake    standard SDK locator
-setup.sh                 clones lib/Pico-PIO-USB
+setup.sh                 clones lib/Pico-PIO-USB at a pinned commit + applies patches/
+patches/                 carried Pico-PIO-USB patches (iso-OUT host support)
 docs/hardware-fix.md     board solder mods + meter-verify + decision flow
 src/
   board_config.h         pins, 120 MHz clock, locked audio format
@@ -302,6 +416,11 @@ src/
 web/
   index.html             the configurator page
   dspico.js              UI, AutoEQ import, response curve, WebUSB protocol
+tests/
+  peq_test.c             native tests for the EQ engine
+  path_test.c            native tests for the signal path + cross-core ring
+  web_test.js            Node tests for the configurator's pure logic
+  run.sh                 builds + runs every host-side suite
 ```
 
 ---
@@ -351,23 +470,30 @@ A commented copy of exactly this (the brief's acceptance-test filter) sits in
 
 ### Verifying the DSP (no hardware needed)
 
-The EQ and signal-path modules are plain C and were validated with the native
-compiler. To reproduce:
+The EQ and signal-path modules are plain C and are validated with the native
+compiler. The test drivers live in [`tests/`](tests/) and run in CI on every
+push (see `.github/workflows/ci.yml`). To reproduce locally:
+
+```bash
+tests/run.sh          # builds + runs every host-side suite (needs gcc, node)
+```
+
+or individually:
 
 ```bash
 # frequency response of designed filters (peaking/shelf/pre-gain/multi-band):
-gcc -O2 -Wall -o peq_test  peq_test.c  src/dsp_peq.c -lm && ./peq_test
+gcc -O2 -Wall -Wextra -I src -o peq_test tests/peq_test.c src/dsp_peq.c -lm && ./peq_test
 # capture -> EQ -> ring -> play, incl. odd chunk sizes + wraparound:
-gcc -O2 -Wall -o path_test path_test.c src/signal_path.c src/dsp_peq.c -lm && ./path_test
+gcc -O2 -Wall -Wextra -I src -o path_test tests/path_test.c src/signal_path.c src/dsp_peq.c -lm && ./path_test
 ```
 
 Measured results: peaking/shelf gains land within ~0.15 dB of target at Fc and
 are flat elsewhere; **the full range is exact — a +6 dB band reads +6.00 dB at
 1 Hz and at 20 kHz, and ±12 dB holds across Q 0.1–10**; out-of-range params clamp
-correctly; pre-gain scales exactly; a flat EQ is bit-transparent; and 640k frames
-survive ring wraparound with zero ordering errors. (Test drivers live under the
-repo's development notes — ask if you want them committed to a `tests/` folder
-with a runner.)
+correctly; pre-gain scales exactly; a flat EQ is **bit-transparent — 0 LSB
+deviation on the packed 24-bit path**; and 640k frames survive ring wraparound
+with zero ordering errors. See [`tests/README.md`](tests/README.md) for the
+full coverage map.
 
 ---
 
@@ -399,13 +525,14 @@ skipped with a note. The device uses the same band count it reports over USB.
 
 **Device protocol.** Vendor control transfers on interface `ITF_NUM_VENDOR`
 (`src/config_usb.c`), kept in sync with `web/dspico.js`: `INFO`, `GET_STATE`,
-`SET_PREGAIN`, `SET_BAND`, `COMMIT` (persist to the last flash sector — core1 is
-frozen during the write), `RESET`. Driverless access uses a WebUSB BOS + MS OS
+`SET_PREGAIN`, `SET_BAND`, `COMMIT` (persist to the last flash sector — ACKed
+immediately, then written from the main loop with core1 briefly frozen), `RESET`. Driverless access uses a WebUSB BOS + MS OS
 2.0 (WinUSB) descriptor. Update the landing-page URL in `usb_descriptors.c`
 (`desc_url`) to wherever you host the page.
 
 The app's pure logic (AutoEQ parser, clamping, response curve) is unit-tested
-with Node; the device half compiles with the rest of the USB stack.
+with Node in [`tests/web_test.js`](tests/web_test.js) (run via `tests/run.sh`);
+the device half compiles with the rest of the USB stack.
 
 ## Next steps (after the gate passes)
 
@@ -414,3 +541,9 @@ with Node; the device half compiles with the rest of the USB stack.
   the real DAC FIFO level so the ring neither starves nor overflows over hours.
 - **Phase 5 — robustness:** DAC hot-plug, PC suspend/resume, richer LED states,
   multiple stored presets.
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).

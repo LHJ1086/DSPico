@@ -16,7 +16,8 @@ void test_tone_config(float freq_hz, float level_dbfs);
 
 // Fill `dst` with `frames` stereo frames of 24-bit packed little-endian audio
 // (6 bytes per frame: L[3] then R[3]). Phase advances across calls so
-// consecutive packets are seamless. Returns bytes written (frames * 6).
+// consecutive packets are seamless. Returns frames written (== `frames`), the
+// same unit signal_path_pull_play() returns, so callers can't mix the two up.
 size_t test_tone_fill(uint8_t *dst, size_t frames);
 
 #endif // DSPICO_TEST_TONE_H

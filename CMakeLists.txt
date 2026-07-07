@@ -38,7 +38,31 @@ add_executable(dspico
     src/dsp_peq.c
     src/signal_path.c
     src/config_usb.c
+    src/debug_log.c
+    # TinyUSB <-> Pico-PIO-USB glue: provides the hcd_* host-controller driver
+    # for rhport 1 (CFG_TUH_RPI_PIO_USB). The dcd_ half self-gates off — we use
+    # the native controller for the device side. The pico-sdk does not create a
+    # tinyusb_pico_pio_usb target, so we add these portable sources directly.
+    ${PICO_TINYUSB_PATH}/src/portable/raspberrypi/pio_usb/dcd_pio_usb.c
+    ${PICO_TINYUSB_PATH}/src/portable/raspberrypi/pio_usb/hcd_pio_usb.c
 )
+
+# Tell Pico-PIO-USB it is being driven through TinyUSB's hcd/dcd glue.
+target_compile_definitions(dspico PRIVATE PIO_USB_USE_TINYUSB)
+
+# The Waveshare RP2350-USB-C/-CM carries a 2 MB flash chip (W25Q16, per the
+# schematic); the generic pico2 board header assumes 4 MB. This must match the
+# real part — the EQ preset lives in the LAST flash sector (config_usb.c),
+# which would otherwise land past the end of the chip.
+target_compile_definitions(dspico PRIVATE PICO_FLASH_SIZE_BYTES=2097152)
+
+# Board variant. The -C and -CM differ only in the PIO-USB port's D+/D- GPIO
+# assignment (swapped). Default = RP2350-USB-C; pass -DDSPICO_BOARD_USB_CM=ON
+# to build for the -CM. See src/board_config.h.
+option(DSPICO_BOARD_USB_CM "Build for the Waveshare RP2350-USB-CM variant" OFF)
+if(DSPICO_BOARD_USB_CM)
+    target_compile_definitions(dspico PRIVATE DSPICO_BOARD_USB_CM=1)
+endif()
 
 # Generate ws2812.pio.h from the PIO source (uses the SDK's pioasm).
 pico_generate_pio_header(dspico ${CMAKE_CURRENT_LIST_DIR}/src/ws2812.pio)

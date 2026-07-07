@@ -35,10 +35,11 @@ void status_led_set(led_state_t state) {
   if (!s_ready) return;
   s_state = state;
   switch (state) {
-    case LED_BOOT:   put_pixel_grb(4, 4, 4);   break;  // dim white
-    case LED_IDLE:   put_pixel_grb(0, 0, 12);  break;  // dim blue
-    case LED_SEARCH: put_pixel_grb(16, 8, 0);  break;  // amber
-    case LED_STREAM: put_pixel_grb(0, 16, 0);  break;  // green
-    case LED_ERROR:  put_pixel_grb(24, 0, 0);  break;  // red
+    case LED_BOOT:      put_pixel_grb(4, 4, 4);   break;  // dim white
+    case LED_IDLE:      put_pixel_grb(0, 0, 12);  break;  // dim blue
+    case LED_SEARCH:    put_pixel_grb(16, 8, 0);  break;  // amber
+    case LED_DAC_SETUP: put_pixel_grb(0, 12, 12); break;  // cyan
+    case LED_STREAM:    put_pixel_grb(0, 16, 0);  break;  // green
+    case LED_ERROR:     put_pixel_grb(24, 0, 0);  break;  // red
   }
 }

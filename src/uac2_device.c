@@ -11,9 +11,22 @@
 
 #include "tusb.h"
 #include "board_config.h"
+#include "debug_log.h"
 #include "usb_descriptors.h"
 #include "uac2_device.h"
 #include "signal_path.h"
+
+// --- Device-stack lifecycle logging (core0) ---------------------------------
+// Mount/unmount/suspend cycles visible in the diagnostic log make PC-side
+// instability (re-enumeration loops, selective suspend) diagnosable from the
+// configurator alone.
+void tud_mount_cb(void)   { dlog0("DSPico device: mounted by PC\n"); }
+void tud_umount_cb(void)  { dlog0("DSPico device: unmounted\n"); }
+void tud_suspend_cb(bool remote_wakeup_en) {
+  (void) remote_wakeup_en;
+  dlog0("DSPico device: suspended by PC\n");
+}
+void tud_resume_cb(void)  { dlog0("DSPico device: resumed\n"); }
 
 // --- Volume / mute state ---------------------------------------------------
 // UAC2 volume is signed 16-bit in 1/256 dB steps. We advertise -60..0 dB.
@@ -25,13 +38,27 @@
 static int16_t s_volume_db256[DSPICO_NUM_CHANNELS + 1] = { -6 * 256, 0, 0 };
 static int8_t  s_mute[DSPICO_NUM_CHANNELS + 1] = { 0, 0, 0 };
 
-static volatile bool s_streaming = false;
+// Written on core0 (USB callbacks), read on core1 (the DAC fill path) — use
+// acquire/release atomics like the ring does, not a bare volatile.
+static bool s_streaming = false;
 
-bool uac2_is_streaming(void) { return s_streaming; }
+static inline void set_streaming(bool on) {
+  __atomic_store_n(&s_streaming, on, __ATOMIC_RELEASE);
+}
+
+bool uac2_is_streaming(void) {
+  return __atomic_load_n(&s_streaming, __ATOMIC_ACQUIRE);
+}
 
 float uac2_host_gain(void) {
   if (s_mute[0]) return 0.0f;
   // Convert master volume (1/256 dB) to a linear gain.
+  //
+  // Deliberately MASTER-ONLY: the descriptor advertises volume/mute controls
+  // on the master channel only (UAC2_FU_CTRL_MASTER in usb_descriptors.c), so
+  // compliant hosts drive index 0. Per-channel SETs are still accepted and
+  // stored (and read back by GET, keeping hosts consistent) but do not affect
+  // the audio — the signal path applies one gain to both channels.
   const float db = (float)s_volume_db256[0] / 256.0f;
   return powf(10.0f, db / 20.0f);
 }
@@ -45,11 +72,13 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
   const uint8_t alt = TU_U16_LOW(p_request->wValue);
 
   if (itf == ITF_NUM_AUDIO_STREAMING) {
-    s_streaming = (alt != 0);   // alt 1 = operational, alt 0 = zero bandwidth
-    if (s_streaming) {
+    const bool on = (alt != 0);   // alt 1 = operational, alt 0 = zero bandwidth
+    dlog0("DSPico device: PC stream %s (alt %u)\n", on ? "OPEN" : "closed", alt);
+    if (on) {
       signal_path_on_stream_start();               // clear filter history
       signal_path_set_host_gain(uac2_host_gain()); // apply current volume/mute
     }
+    set_streaming(on);
   }
   return true;
 }
@@ -58,7 +87,7 @@ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const 
   (void) rhport;
   const uint8_t itf = TU_U16_LOW(p_request->wIndex);
   if (itf == ITF_NUM_AUDIO_STREAMING) {
-    s_streaming = false;
+    set_streaming(false);
   }
   return true;
 }
@@ -79,6 +108,14 @@ bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received,
     if (got == 0) break;
     remaining -= got;
     signal_path_push_capture(scratch, got);   // EQ + enqueue toward the DAC
+  }
+
+  // Inbound heartbeat (~8 s): proves PC audio is actually reaching us, and
+  // the ring fill shows whether the DAC side is draining it.
+  static uint32_t rx_pkts;
+  if ((++rx_pkts & 0x1FFF) == 0) {
+    dlog0("DSPico device: RX heartbeat — %lu pkts from PC, play ring %lu B\n",
+          (unsigned long) rx_pkts, (unsigned long) signal_path_play_fill());
   }
   return true;
 }
