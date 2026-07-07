@@ -28,6 +28,13 @@ typedef struct {
   uint16_t audio_bcd;       // 0x0100 = UAC1, 0x0200 = UAC2
   uint8_t  clock_id;        // UAC2 Clock Source entity (0 if none)
 
+  // Feature Unit discovery, to unmute/set volume on the DAC's playback path
+  // (real hosts always do this; DACs may power up muted or at minimum volume).
+  uint8_t  fu_ids[8];       // every Feature Unit seen in the AC block
+  uint8_t  fu_count;
+  uint8_t  ot_source_id;    // bSourceID of the speaker/headphone Output Terminal
+  uint8_t  fu_id;           // the FU we drive (resolved in dac_set_config)
+
   uint8_t  as_itf;          // Audio Streaming interface number
   uint8_t  as_alt;          // operational alt setting (has the iso EP)
   bool     have_as;
@@ -80,6 +87,11 @@ typedef struct {
 // 24-bit alt over a 16-bit one; within the same width keep the first found.
 static void consider_candidate(dac_dev_t *d, const alt_cand_t *c,
                                tusb_desc_endpoint_t const *ep) {
+  // Log every candidate so an "incompatible" verdict is diagnosable from the
+  // UART without a USB analyzer.
+  printf("DSPico host: alt itf %u.%u: ch=%u subslot=%u bits=%u pcm=%d rate48=%d maxpkt=%u\n",
+         c->itf, c->alt, c->channels, c->subslot, c->bits,
+         (int) c->pcm, (int) c->rate_ok, ep->wMaxPacketSize);
   if (!c->pcm || !c->rate_ok) return;
   if (c->channels != DSPICO_NUM_CHANNELS) return;
   if (c->subslot != 3 && c->subslot != 2) return;
@@ -152,6 +164,13 @@ static void parse_audio_function(dac_dev_t *d, uint8_t const *p, uint16_t len) {
         d->audio_bcd = tu_unaligned_read16(p + 3);   // bcdADC
       } else if (subtype == AUDIO_CS_AC_INTERFACE_CLOCK_SOURCE) {
         d->clock_id = p[3];                            // bClockID
+      } else if (subtype == AUDIO_CS_AC_INTERFACE_FEATURE_UNIT && dlen >= 5) {
+        if (d->fu_count < sizeof(d->fu_ids)) d->fu_ids[d->fu_count++] = p[3];
+      } else if (subtype == AUDIO_CS_AC_INTERFACE_OUTPUT_TERMINAL && dlen >= 8) {
+        // Remember the speaker/headphone terminal's source: if that source is
+        // a Feature Unit, it's the one controlling playback volume/mute.
+        const uint16_t ttype = tu_unaligned_read16(p + 4);
+        if ((ttype & 0xFF00) == 0x0300) d->ot_source_id = p[7];   // 0x03xx = output
       }
     } else if (dtype == TUSB_DESC_CS_INTERFACE && cand.in_as_itf) {
       const uint8_t subtype = p[2];
@@ -228,6 +247,74 @@ static void on_set_freq_complete(tuh_xfer_t *xfer);
 
 static bool setup_is_uac2(void) {
   return s_dac.audio_bcd >= 0x0200 && s_dac.clock_id != 0;
+}
+
+// --- DAC Feature-Unit init (unmute + 0 dB volume) ----------------------------
+// Real hosts set the playback Feature Unit's mute/volume right after
+// enumeration, and DACs are tested against that — some power up muted or at
+// minimum volume and stay silent forever if nobody does it. The wire format is
+// the same for UAC1 (SET_CUR) and UAC2 (CUR): bRequest 0x01, wValue =
+// (selector << 8) | channel, wIndex = (fu_id << 8) | ac_itf. Controls a DAC
+// doesn't implement simply STALL; every step tolerates that and moves on.
+static void finish_setup(void);
+
+static const struct { uint8_t sel, ch, len; } s_fu_steps[] = {
+  { AUDIO_FU_CTRL_MUTE,   0, 1 }, { AUDIO_FU_CTRL_MUTE,   1, 1 },
+  { AUDIO_FU_CTRL_MUTE,   2, 1 },
+  { AUDIO_FU_CTRL_VOLUME, 0, 2 }, { AUDIO_FU_CTRL_VOLUME, 1, 2 },
+  { AUDIO_FU_CTRL_VOLUME, 2, 2 },
+};
+static uint8_t s_fu_step;
+static uint8_t s_fu_buf[2];   // mute: {0}; volume: 0x0000 = 0.0 dB (1/256 dB units)
+
+static void fu_send_next(void);
+
+static void on_fu_step_complete(tuh_xfer_t *xfer) {
+  const uint8_t i = s_fu_step - 1;
+  printf("DSPico host: FU %u %s ch%u -> %s\n", s_dac.fu_id,
+         s_fu_steps[i].sel == AUDIO_FU_CTRL_MUTE ? "unmute" : "vol 0dB",
+         s_fu_steps[i].ch,
+         xfer->result == XFER_RESULT_SUCCESS ? "OK" : "stalled (not implemented)");
+  fu_send_next();
+}
+
+static void fu_send_next(void) {
+  if (s_dac.fu_id == 0 || s_fu_step >= TU_ARRAY_SIZE(s_fu_steps)) {
+    finish_setup();
+    return;
+  }
+  const uint8_t i = s_fu_step++;
+  s_fu_buf[0] = 0; s_fu_buf[1] = 0;   // unmuted / 0.0 dB
+
+  tusb_control_request_t const req = {
+      .bmRequestType_bit = { .recipient = TUSB_REQ_RCPT_INTERFACE,
+                             .type = TUSB_REQ_TYPE_CLASS,
+                             .direction = TUSB_DIR_OUT },
+      .bRequest = AUDIO_CS_REQ_CUR,   // == UAC1 SET_CUR (0x01)
+      .wValue = tu_htole16((uint16_t) ((s_fu_steps[i].sel << 8) | s_fu_steps[i].ch)),
+      .wIndex = tu_htole16((uint16_t) ((s_dac.fu_id << 8) | s_dac.ac_itf)),
+      .wLength = tu_htole16(s_fu_steps[i].len),
+  };
+  tuh_xfer_t xfer = {
+      .daddr = s_dac.dev_addr,
+      .ep_addr = 0,
+      .setup = &req,
+      .buffer = s_fu_buf,
+      .complete_cb = on_fu_step_complete,
+      .user_data = 0,
+  };
+  tuh_control_xfer(&xfer);
+}
+
+static void start_fu_init(void) {
+  s_fu_step = 0;
+  if (s_dac.fu_id) {
+    printf("DSPico host: initialising DAC Feature Unit %u (unmute + 0 dB)\n",
+           s_dac.fu_id);
+  } else {
+    printf("DSPico host: no Feature Unit found — skipping volume init\n");
+  }
+  fu_send_next();
 }
 
 // Final step for both protocols: open the iso OUT endpoint and start pumping.
@@ -340,6 +427,14 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
          s_dac.ep_out.bEndpointAddress, s_dac.ep_out.wMaxPacketSize,
          s_dac.subslot == 2 ? " (16-bit fallback, truncating)" : "");
 
+  // Resolve the playback Feature Unit for the volume-init step: prefer the
+  // unit that feeds the speaker/headphone Output Terminal, else the first.
+  s_dac.fu_id = 0;
+  for (uint8_t i = 0; i < s_dac.fu_count; i++) {
+    if (s_dac.fu_ids[i] == s_dac.ot_source_id) { s_dac.fu_id = s_dac.ot_source_id; break; }
+  }
+  if (s_dac.fu_id == 0 && s_dac.fu_count > 0) s_dac.fu_id = s_dac.fu_ids[0];
+
   // Kick the setup chain (see the ordering note above).
   if (setup_is_uac2()) {
     send_set_sample_rate_uac2();   // rate first, then alt
@@ -359,7 +454,7 @@ static void on_set_alt_complete(tuh_xfer_t *xfer) {
     return;
   }
   if (setup_is_uac2()) {
-    finish_setup();                // UAC2: rate was already set — go stream
+    start_fu_init();               // UAC2: rate already set — unmute, then stream
   } else {
     send_set_sample_rate_uac1();   // UAC1: rate lives on the (now active) EP
   }
@@ -373,7 +468,7 @@ static void on_set_freq_complete(tuh_xfer_t *xfer) {
   if (setup_is_uac2()) {
     send_set_interface();          // UAC2: now activate the alt
   } else {
-    finish_setup();                // UAC1: alt already active — go stream
+    start_fu_init();               // UAC1: alt+rate done — unmute, then stream
   }
 }
 
@@ -427,9 +522,15 @@ static void submit_packet(void) {
 static void submit_first_packet(void) { submit_packet(); }
 
 // Iso has no retransmit; even on a (rare) error we keep the cadence going by
-// immediately queuing the next frame.
+// immediately queuing the next frame. A periodic heartbeat on the UART proves
+// packets are actually flowing (~1000/s expected at 48 kHz).
 static void on_iso_complete(tuh_xfer_t *xfer) {
   if (xfer->daddr != s_dac.dev_addr) return;
+  static uint32_t pkts;
+  if ((++pkts & 0x1FFF) == 0) {   // every 8192 packets ≈ 8 s
+    printf("DSPico host: streaming heartbeat — %lu iso packets sent\n",
+           (unsigned long) pkts);
+  }
   submit_packet();
 }
 

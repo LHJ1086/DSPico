@@ -299,9 +299,16 @@ taking priority:
   step (`SET_INTERFACE`, sample rate, endpoint open) and the DAC's VID:PID.
 - **Cyan forever** → a setup control transfer is hanging; UART shows the last
   step reached.
-- **Green but silent** → the stream is running; check the PC actually plays to
-  "DSPico EQ Bridge" and the OS volume/mute, then suspect iso data timing (the
-  Phase 1b analyzer check below).
+- **Green but silent** → the stream is running. The firmware now **unmutes the
+  DAC's own Feature Unit and sets it to 0 dB** after setup (some DACs power up
+  muted and real hosts always do this — the UART shows each `FU … unmute/vol`
+  step). If it's still silent: check the PC actually plays to "DSPico EQ
+  Bridge" and the OS volume/mute, then suspect iso data timing (the Phase 1b
+  analyzer check below).
+- **Blue with a Type-C DAC dongle** → try **flipping the Type-C plug 180°**
+  or a USB-A adapter: the port's CC resistors are orientation-asymmetric, so
+  some dongles only detect a source one way up. A captive/Type-A-cabled DAC
+  avoids this entirely.
 
 **WebUSB configurator won't connect** (the page's log panel names the failing
 step and prints hints):
@@ -313,6 +320,11 @@ step and prints hints):
 - **Linux:** Chrome needs rw access to the USB node:
   `sudo cp docs/99-dspico.rules /etc/udev/rules.d/ && sudo udevadm control --reload`,
   then replug.
+- **"The device was disconnected" during connect** → the handle went stale
+  (Windows re-enumerates the device right after (re)binding its driver).
+  Just click **Connect again** — the current page recovers cleanly and
+  retries; make sure you're on the up-to-date configurator (redeploy Pages
+  after updating `web/`, or serve it locally).
 - Works only in **Chrome/Edge/Chromium** over **https or localhost**, and the
   device must not be held open by another tab or app.
 
