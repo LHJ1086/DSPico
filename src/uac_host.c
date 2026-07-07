@@ -83,9 +83,16 @@ typedef struct {
   bool    in_as_itf;   // currently inside an AS interface's descriptors
 } alt_cand_t;
 
+// Which wire sample width to prefer when a DAC offers both. Field results:
+// 16-bit (2-byte subslot) is PROVEN AUDIBLE over the patched PIO host, while
+// the larger 24-bit packets are still under investigation — so bring-up
+// prefers 16-bit. Set to 3 to prefer native 24-bit once that path is proven.
+#ifndef UAC_HOST_PREFER_SUBSLOT
+#define UAC_HOST_PREFER_SUBSLOT 2
+#endif
+
 // Accept an alt setting if it can take our stream: stereo Type-I PCM at 48 kHz
-// in a 3-byte (native 24-bit) or 2-byte (16-bit fallback) subslot. Prefer a
-// 24-bit alt over a 16-bit one; within the same width keep the first found.
+// in a 2-byte (16-bit) or 3-byte (24-bit) subslot; see the preference above.
 static void consider_candidate(dac_dev_t *d, const alt_cand_t *c,
                                tusb_desc_endpoint_t const *ep) {
   // Log every candidate so an "incompatible" verdict is diagnosable from the
@@ -97,7 +104,11 @@ static void consider_candidate(dac_dev_t *d, const alt_cand_t *c,
   if (c->channels != DSPICO_NUM_CHANNELS) return;
   if (c->subslot != 3 && c->subslot != 2) return;
   if (ep->wMaxPacketSize < DSPICO_NUM_CHANNELS * c->subslot) return;
-  if (d->have_ep && d->subslot >= c->subslot) return;   // existing pick is >= tier
+  if (d->have_ep) {
+    const bool cur_pref = (d->subslot == UAC_HOST_PREFER_SUBSLOT);
+    const bool new_pref = (c->subslot == UAC_HOST_PREFER_SUBSLOT);
+    if (cur_pref || !new_pref) return;   // keep unless upgrading to preferred
+  }
 
   d->as_itf  = c->itf;
   d->as_alt  = c->alt;
@@ -317,8 +328,20 @@ static void timeout_alt(void) {
   s_dac.incompatible = true;
   usbh_driver_set_config_complete(s_dac.dev_addr, s_dac.as_itf);
 }
+static void send_set_sample_rate_uac1(void);
+static void send_set_sample_rate_uac2(void);
+static uint8_t s_rate_tries;
+
 static void timeout_rate(void) {
-  // Treat like a stalled rate request: continue — 48 kHz-only DACs don't care.
+  // A NAK-forever rate request may still succeed on a retry once the DAC has
+  // settled (the audible symptom of an unset rate is wrong-pitch playback) —
+  // try a couple more times before continuing without it.
+  if (++s_rate_tries < 3) {
+    dlog("DSPico host: retrying sample-rate set (%u/3)\n", (unsigned) (s_rate_tries + 1));
+    if (setup_is_uac2()) send_set_sample_rate_uac2();
+    else                 send_set_sample_rate_uac1();
+    return;
+  }
   if (setup_is_uac2()) send_set_interface();
   else                 start_fu_init();
 }
@@ -416,10 +439,16 @@ static void start_fu_init(void) {
   fu_send_next();
 }
 
+// Per-stream packet stats for the heartbeat (reset at every stream start).
+static uint32_t s_iso_pkts;
+static uint32_t s_stream_t0_ms;
+
 // Final step for both protocols: open the iso OUT endpoint and start pumping.
 static void finish_setup(void) {
   disarm_step_watchdog();
   if (tuh_edpt_open(s_dac.dev_addr, &s_dac.ep_out)) {
+    s_iso_pkts = 0;
+    s_stream_t0_ms = to_ms_since_boot(get_absolute_time());
     s_dac.streaming = true;
     dlog("DSPico host: streaming started (EP 0x%02X, %u-byte subslot)\n",
            s_dac.ep_out.bEndpointAddress, s_dac.subslot);
@@ -551,6 +580,7 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
   if (s_dac.fu_id == 0 && s_dac.fu_count > 0) s_dac.fu_id = s_dac.fu_ids[0];
 
   // Kick the setup chain (see the ordering note above).
+  s_rate_tries = 0;
   if (setup_is_uac2()) {
     send_set_sample_rate_uac2();   // rate first, then alt
   } else {
@@ -645,13 +675,16 @@ static void submit_first_packet(void) { submit_packet(); }
 // packets are actually flowing (~1000/s expected at 48 kHz).
 static void on_iso_complete(tuh_xfer_t *xfer) {
   if (xfer->daddr != s_dac.dev_addr) return;
-  static uint32_t pkts;
-  if ((++pkts & 0x1FFF) == 0) {   // every 8192 packets ≈ 8 s
-    // Ring fill says where a silence problem lives: ~0 with the PC playing
-    // means PC audio isn't arriving (device side); large+stable means the
-    // path is healthy and any silence is downstream of us.
-    dlog("DSPico host: heartbeat — %lu iso pkts sent, play ring %lu B\n",
-           (unsigned long) pkts, (unsigned long) signal_path_play_fill());
+  if ((++s_iso_pkts & 0x1FFF) == 0) {   // every 8192 packets ≈ 8 s
+    // Rate must sit at ~1000 pkts/s (one per USB frame). Ring fill says where
+    // a silence problem lives: ~0 with the PC playing means PC audio isn't
+    // arriving (device side); large+stable means the path is healthy and any
+    // silence is downstream of us.
+    const uint32_t ms = to_ms_since_boot(get_absolute_time()) - s_stream_t0_ms;
+    dlog("DSPico host: heartbeat — %lu pkts this stream (%lu pkts/s), play ring %lu B\n",
+           (unsigned long) s_iso_pkts,
+           (unsigned long) (ms ? (uint64_t) s_iso_pkts * 1000u / ms : 0),
+           (unsigned long) signal_path_play_fill());
   }
   submit_packet();
 }
