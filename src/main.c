@@ -132,11 +132,16 @@ int main(void) {
     tud_task();
     config_usb_task();   // deferred flash commit (too slow for a USB callback)
 
-    // Coarse status: streaming to DAC > enumerated device > searching.
+    // Glanceable status, host side first (that's where bring-up problems
+    // live): green = streaming, red = DAC attached but unusable/failed,
+    // cyan = DAC negotiating, blue = PC connected (no DAC), amber = nothing.
     led_state_t want;
-    if (uac_host_is_streaming())      want = LED_STREAM;
-    else if (tud_mounted())           want = LED_IDLE;
-    else                              want = LED_SEARCH;
+    switch (uac_host_state()) {
+      case UAC_HOST_STREAMING:    want = LED_STREAM;    break;
+      case UAC_HOST_INCOMPATIBLE: want = LED_ERROR;     break;
+      case UAC_HOST_SETUP:        want = LED_DAC_SETUP; break;
+      default:                    want = tud_mounted() ? LED_IDLE : LED_SEARCH;
+    }
     if (want != shown) {
       shown = want;
       status_led_set(shown);

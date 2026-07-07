@@ -32,7 +32,10 @@ static tusb_desc_device_t const desc_device = {
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = USB_VID,
     .idProduct          = USB_PID,
-    .bcdDevice          = 0x0100,
+    // Windows caches the MS OS 2.0 / WinUSB binding per VID/PID/bcdDevice.
+    // Bump this whenever the descriptor layout or the vendor-interface driver
+    // story changes, or old (possibly failed) bindings stick forever.
+    .bcdDevice          = 0x0102,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x03,

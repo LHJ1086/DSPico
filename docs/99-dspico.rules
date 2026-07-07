@@ -1,0 +1,8 @@
+# DSPico — udev rule so Chrome/Chromium (WebUSB) can open the device without
+# root on Linux.
+#
+# Install:
+#   sudo cp docs/99-dspico.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+# then unplug and replug the DSPico.
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="d590", TAG+="uaccess", MODE="0664", GROUP="plugdev"

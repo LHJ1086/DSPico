@@ -274,11 +274,55 @@ screen /dev/tty.usbserial-XXXX 115200
 
 ---
 
+## First-boot troubleshooting (read the LED first)
+
+The status LED (WS2812 on GPIO16) tells you which half is stuck, host side
+taking priority:
+
+| Colour | Meaning |
+|--------|---------|
+| dim white | booting |
+| **amber** | nothing usable on either port — no DAC detected on Type-C2 |
+| **blue** | PC enumerated us; **no DAC seen** on the host port |
+| **cyan** | DAC attached, negotiation/setup in progress (should be brief) |
+| **green** | iso audio streaming to the DAC |
+| **red** | DAC attached but **incompatible** (no stereo 48 kHz PCM alt) or setup failed |
+
+**No sound to the DAC** — walk the LED:
+- **Blue with the DAC plugged in** → the DAC never enumerates. Check: right
+  board-variant build flashed? (-C vs -CM pins are swapped — see *Hardware
+  mods*); self-powered DAC (the PIO port has no VBUS management); try the
+  D+ pull-up removal per `docs/hardware-fix.md`; try a different cable
+  (captive/Type-A-cabled DACs avoid Type-C CC issues).
+- **Red** → the DAC enumerated but offers no stereo 48 kHz 16/24-bit PCM alt,
+  or a setup step failed — the UART log (GPIO0, 115200) prints exactly which
+  step (`SET_INTERFACE`, sample rate, endpoint open) and the DAC's VID:PID.
+- **Cyan forever** → a setup control transfer is hanging; UART shows the last
+  step reached.
+- **Green but silent** → the stream is running; check the PC actually plays to
+  "DSPico EQ Bridge" and the OS volume/mute, then suspect iso data timing (the
+  Phase 1b analyzer check below).
+
+**WebUSB configurator won't connect** (the page's log panel names the failing
+step and prints hints):
+- **Windows:** the WinUSB driver must bind to the config interface via the
+  MS OS 2.0 descriptor, and Windows **caches** that per firmware version. This
+  firmware bumps the device version so a replug re-reads it; if it still
+  fails, open Device Manager → find the DSPico entry → *Uninstall device*
+  (tick "delete driver") → replug.
+- **Linux:** Chrome needs rw access to the USB node:
+  `sudo cp docs/99-dspico.rules /etc/udev/rules.d/ && sudo udevadm control --reload`,
+  then replug.
+- Works only in **Chrome/Edge/Chromium** over **https or localhost**, and the
+  device must not be held open by another tab or app.
+
+---
+
 ## Running the go/no-go gates (human-in-the-loop)
 
 **Phase 0 sanity** — on power-up the status LED (WS2812 on GPIO16) shows:
-white (boot) → then amber (searching for DAC) / blue (enumerated by PC) /
-green (streaming to DAC).
+white (boot) → then amber/blue (no DAC) → cyan (DAC negotiating) →
+green (streaming to DAC); red = incompatible DAC (see the table above).
 
 **Phase 1a — device** (Type-C1 → PC):
 - The OS lists **"DSPico EQ Bridge"** as a selectable **output** device.

@@ -260,17 +260,44 @@ function onTableInput(e){
 // ===========================================================================
 // WebUSB
 // ===========================================================================
+// Map a failed connect step + error onto something actionable. The usual
+// culprits are OS driver/permission issues, not the device itself.
+function connectHint(step, err){
+  const lines = [`Connect failed at ${step}: ${err.name}: ${err.message}`];
+  if (step === 'open' || step === 'claimInterface') {
+    lines.push('Hints:');
+    lines.push(' • Windows: the WinUSB driver may not be bound to the config interface.');
+    lines.push('   Unplug/replug the device (this firmware bumps bcdDevice so Windows');
+    lines.push('   re-reads the driver descriptors). If it still fails: Device Manager →');
+    lines.push('   find the DSPico entry → Uninstall device (tick "delete driver") → replug.');
+    lines.push(' • Linux: your user needs rw access to the USB node. Install the udev rule:');
+    lines.push('   sudo cp docs/99-dspico.rules /etc/udev/rules.d/ && sudo udevadm control --reload');
+    lines.push('   then replug the device.');
+    lines.push(' • Close other tabs/apps that may hold the device open.');
+  } else if (step === 'readInfo') {
+    lines.push('The interface was claimed but the device did not answer the INFO request —');
+    lines.push('likely an old firmware on the device. Reflash the current dspico.uf2.');
+  }
+  return lines.join('\n');
+}
+
 async function connect(){
   if (!('usb' in navigator)) { log('WebUSB not available — use Chrome/Edge over https or localhost.', 'e'); return; }
+  let step = 'requestDevice';
   try {
     usbDevice = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x1209, productId: 0xD590 }] });
-    await usbDevice.open();
+    step = 'open';           await usbDevice.open();
+    step = 'selectConfiguration';
     if (usbDevice.configuration === null) await usbDevice.selectConfiguration(1);
-    await usbDevice.claimInterface(PROTO.ITF_VENDOR);
-    await readInfo();
+    step = 'claimInterface'; await usbDevice.claimInterface(PROTO.ITF_VENDOR);
+    step = 'readInfo';       await readInfo();
     setConnected(true);
     log('Connected.');
-  } catch (err) { log('Connect failed: ' + err.message, 'e'); setConnected(false); }
+  } catch (err) {
+    log(connectHint(step, err), 'e');
+    setConnected(false);
+    usbDevice = null;
+  }
 }
 
 function setConnected(on){

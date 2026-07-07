@@ -38,6 +38,7 @@ typedef struct {
   tusb_desc_endpoint_t ep_out;   // the isochronous OUT endpoint descriptor
   bool     have_ep;
 
+  bool     incompatible;    // audio device seen, but nothing we can stream to
   bool     streaming;
 } dac_dev_t;
 
@@ -49,6 +50,13 @@ CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN static uint8_t s_pkt[UAC_HOST_PKT_MAX];
 
 void uac_host_set_source(uac_host_fill_cb_t cb) { s_fill_cb = cb; }
 bool uac_host_is_streaming(void) { return s_dac.in_use && s_dac.streaming; }
+
+uac_host_state_t uac_host_state(void) {
+  if (!s_dac.in_use)      return UAC_HOST_NO_DAC;
+  if (s_dac.streaming)    return UAC_HOST_STREAMING;
+  if (s_dac.incompatible || !s_dac.have_as) return UAC_HOST_INCOMPATIBLE;
+  return UAC_HOST_SETUP;
+}
 
 // ---------------------------------------------------------------------------
 // Descriptor parsing helpers
@@ -193,6 +201,12 @@ static bool dac_open(uint8_t rhport, uint8_t dev_addr,
 
   // Bind to the first audio device we see (single-DAC spike).
   if (s_dac.in_use && s_dac.dev_addr != dev_addr) return false;
+  if (!s_dac.in_use) {
+    uint16_t vid = 0, pid = 0;
+    tuh_vid_pid_get(dev_addr, &vid, &pid);
+    printf("DSPico host: audio device attached (addr %u, VID:PID %04X:%04X)\n",
+           dev_addr, vid, pid);
+  }
   s_dac.in_use = true;
   s_dac.dev_addr = dev_addr;
   s_dac.rhport = rhport;
@@ -201,10 +215,35 @@ static bool dac_open(uint8_t rhport, uint8_t dev_addr,
   return true;   // claim the audio interface(s) in this block
 }
 
-// --- Setup state machine (runs after enumeration) --------------------------
+// --- Setup state machine (runs after enumeration) ---------------------------
+// Step order matters and differs by UAC version (matching what Linux/Windows
+// do, which is what DACs are tested against):
+//   UAC2: SET_CUR(clock = 48 kHz) FIRST (alt still 0), then SET_INTERFACE(alt)
+//         — many DACs reject or ignore a rate change on an already-active alt.
+//   UAC1: SET_INTERFACE(alt) first, then the endpoint SAMPLING_FREQ control
+//         — the endpoint only exists once the alt is active.
 static void submit_first_packet(void);
 static void on_set_alt_complete(tuh_xfer_t *xfer);
 static void on_set_freq_complete(tuh_xfer_t *xfer);
+
+static bool setup_is_uac2(void) {
+  return s_dac.audio_bcd >= 0x0200 && s_dac.clock_id != 0;
+}
+
+// Final step for both protocols: open the iso OUT endpoint and start pumping.
+static void finish_setup(void) {
+  if (tuh_edpt_open(s_dac.dev_addr, &s_dac.ep_out)) {
+    s_dac.streaming = true;
+    printf("DSPico host: streaming started (EP 0x%02X, %u-byte subslot)\n",
+           s_dac.ep_out.bEndpointAddress, s_dac.subslot);
+    submit_first_packet();
+  } else {
+    s_dac.incompatible = true;
+    printf("DSPico host: ERROR — tuh_edpt_open(0x%02X) failed\n",
+           s_dac.ep_out.bEndpointAddress);
+  }
+  usbh_driver_set_config_complete(s_dac.dev_addr, s_dac.as_itf);
+}
 
 // SET_INTERFACE(as_itf, as_alt) — activates the iso endpoint on the DAC.
 static void send_set_interface(void) {
@@ -288,44 +327,54 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
   // immediately configured.
   if (!s_dac.have_as || itf_num != s_dac.as_itf) {
     if (!s_dac.have_as && itf_num == s_dac.ac_itf) {
+      s_dac.incompatible = true;
       printf("DSPico host: DAC has no stereo 48 kHz Type-I PCM alt (16/24-bit) — not streaming\n");
     }
     usbh_driver_set_config_complete(dev_addr, itf_num);
     return true;
   }
 
-  printf("DSPico host: DAC itf %u alt %u — %u-bit in %u-byte subslot, EP 0x%02X maxpkt %u%s\n",
+  printf("DSPico host: DAC (UAC%c) itf %u alt %u — %u-bit in %u-byte subslot, EP 0x%02X maxpkt %u%s\n",
+         setup_is_uac2() ? '2' : '1',
          s_dac.as_itf, s_dac.as_alt, s_dac.bits, s_dac.subslot,
          s_dac.ep_out.bEndpointAddress, s_dac.ep_out.wMaxPacketSize,
          s_dac.subslot == 2 ? " (16-bit fallback, truncating)" : "");
 
-  // Kick the setup chain: set alt -> set sample rate -> open EP + stream.
-  send_set_interface();
+  // Kick the setup chain (see the ordering note above).
+  if (setup_is_uac2()) {
+    send_set_sample_rate_uac2();   // rate first, then alt
+  } else {
+    send_set_interface();          // alt first, then endpoint rate
+  }
   return true;
 }
 
 static void on_set_alt_complete(tuh_xfer_t *xfer) {
+  printf("DSPico host: SET_INTERFACE(itf %u, alt %u) -> %s\n",
+         s_dac.as_itf, s_dac.as_alt,
+         xfer->result == XFER_RESULT_SUCCESS ? "OK" : "FAILED");
   if (xfer->result != XFER_RESULT_SUCCESS) {
+    s_dac.incompatible = true;
     usbh_driver_set_config_complete(s_dac.dev_addr, s_dac.as_itf);
     return;
   }
-  if (s_dac.audio_bcd >= 0x0200 && s_dac.clock_id != 0) {
-    send_set_sample_rate_uac2();
+  if (setup_is_uac2()) {
+    finish_setup();                // UAC2: rate was already set — go stream
   } else {
-    send_set_sample_rate_uac1();
+    send_set_sample_rate_uac1();   // UAC1: rate lives on the (now active) EP
   }
 }
 
 static void on_set_freq_complete(tuh_xfer_t *xfer) {
-  // A DAC that only supports 48 kHz may STALL the set-rate request; that's fine,
-  // continue anyway.
-  (void) xfer;
-
-  if (tuh_edpt_open(s_dac.dev_addr, &s_dac.ep_out)) {
-    s_dac.streaming = true;
-    submit_first_packet();
+  // A DAC that only supports 48 kHz may STALL the set-rate request; that's
+  // fine — its fixed rate is the one we want anyway. Log it either way.
+  printf("DSPico host: SET sample rate 48000 -> %s\n",
+         xfer->result == XFER_RESULT_SUCCESS ? "OK" : "stalled/failed (continuing)");
+  if (setup_is_uac2()) {
+    send_set_interface();          // UAC2: now activate the alt
+  } else {
+    finish_setup();                // UAC1: alt already active — go stream
   }
-  usbh_driver_set_config_complete(s_dac.dev_addr, s_dac.as_itf);
 }
 
 // --- Isochronous streaming loop --------------------------------------------
@@ -394,6 +443,7 @@ static bool dac_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result,
 
 static void dac_close(uint8_t dev_addr) {
   if (dev_addr != s_dac.dev_addr) return;
+  printf("DSPico host: DAC disconnected\n");
   memset(&s_dac, 0, sizeof(s_dac));
 }
 
