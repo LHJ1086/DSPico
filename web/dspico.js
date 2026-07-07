@@ -6,7 +6,7 @@
 
 // Bumped on every configurator change and printed in the Ready line, so a
 // stale/cached deployment is immediately visible in any pasted log.
-const APP_REV = 'r9';
+const APP_REV = 'r10';
 
 // --- Shared protocol contract (keep in sync with the firmware) --------------
 const PROTO = {
@@ -414,13 +414,19 @@ async function ctrlOut(request, data=new ArrayBuffer(0), index=PROTO.ITF_VENDOR)
 }
 
 async function readInfo(){
-  const d = await ctrlIn(PROTO.REQ_INFO, 12);
+  const d = await ctrlIn(PROTO.REQ_INFO, 16);
   const magic = d.getUint32(0, true);
   if (magic !== PROTO.MAGIC) { log('Warning: unexpected device magic 0x'+magic.toString(16), 'e'); }
   const version = d.getUint16(4, true);
   MAX_BANDS   = d.getUint8(6);
   SAMPLE_RATE = d.getUint32(8, true);
-  $('devinfo').textContent = `DSPico v${version} · ${MAX_BANDS} bands · ${SAMPLE_RATE/1000|0}kHz`;
+  let uptime = '';
+  if (d.byteLength >= 16) {                      // newer firmware reports uptime
+    const up = d.getUint32(12, true);
+    uptime = ` · up ${up}s`;
+    log(`Device uptime: ${up} s${up < 30 ? '  ← very recent boot; if this stays small the board is RESETTING (check power / see the boot lines in this log)' : ''}`);
+  }
+  $('devinfo').textContent = `DSPico v${version} · ${MAX_BANDS} bands · ${SAMPLE_RATE/1000|0}kHz${uptime}`;
 }
 
 function packBand(b){

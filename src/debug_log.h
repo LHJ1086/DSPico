@@ -21,6 +21,10 @@
 // dropped rather than blocking.
 void dlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+// Same, but for CORE0 producers (device-stack events, boot banner): goes
+// straight to the UART and the USB buffer, no cross-core ring involved.
+void dlog0(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 // core0 main loop: forward pending log bytes to the UART and the USB buffer.
 void dlog_task(void);
 

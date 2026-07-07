@@ -15,6 +15,7 @@
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/clocks.h"
+#include "hardware/structs/powman.h"
 
 #include "pio_usb.h"
 #include "tusb.h"
@@ -98,7 +99,20 @@ int main(void) {
   stdio_init_all();                 // debug over UART (see CMakeLists)
   status_led_init();
 
-  printf("\nDSPico — Phase 0/1 firmware, sysclk=%lu kHz\n", (unsigned long) DSPICO_SYS_CLK_KHZ);
+  // Boot banner with the RESET CAUSE — the decisive datapoint for "is the
+  // board silently resetting?": repeated BROWNOUT lines mean the supply is
+  // sagging (e.g. a bus-powered DAC pulling the shared rail down); repeated
+  // banners of any kind while in use mean the board is crash-looping.
+  const uint32_t rst = powman_hw->chip_reset;
+  dlog0("\nDSPico boot — reset cause:%s%s%s%s%s (0x%08lx), sysclk=%lu kHz\n",
+        (rst & POWMAN_CHIP_RESET_HAD_POR_BITS)     ? " power-on"  : "",
+        (rst & POWMAN_CHIP_RESET_HAD_BOR_BITS)     ? " BROWNOUT"  : "",
+        (rst & POWMAN_CHIP_RESET_HAD_RUN_LOW_BITS) ? " run/reset-pin" : "",
+        (rst & (POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_RSM_BITS |
+                POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_SWCORE_BITS |
+                POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_POWMAN_BITS)) ? " watchdog" : "",
+        (rst & POWMAN_CHIP_RESET_HAD_DP_RESET_REQ_BITS) ? " debugger" : "",
+        (unsigned long) rst, (unsigned long) DSPICO_SYS_CLK_KHZ);
 
   // On-device signal path (PEQ engine + play ring). Flat by default; the UAC2
   // volume callback and the WebUSB config handler configure it live.

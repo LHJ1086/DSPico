@@ -7,6 +7,7 @@
 
 #include "tusb.h"
 #include "pico/multicore.h"
+#include "pico/time.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 
@@ -144,7 +145,12 @@ static uint16_t build_info(uint8_t *b) {
   b[6] = PEQ_MAX_BANDS;
   b[7] = 0;
   uint32_t sr = DSPICO_SAMPLE_RATE_HZ; memcpy(b + 8, &sr, 4);
-  return 12;
+  // Uptime (whole seconds) — a device that always reports a tiny uptime is
+  // reset-looping, which the configurator flags. Older clients that request
+  // only 12 bytes simply don't see this field.
+  uint32_t up = to_ms_since_boot(get_absolute_time()) / 1000u;
+  memcpy(b + 12, &up, 4);
+  return 16;
 }
 
 static uint16_t build_state(uint8_t *b) {

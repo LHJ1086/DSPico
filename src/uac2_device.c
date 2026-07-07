@@ -11,9 +11,22 @@
 
 #include "tusb.h"
 #include "board_config.h"
+#include "debug_log.h"
 #include "usb_descriptors.h"
 #include "uac2_device.h"
 #include "signal_path.h"
+
+// --- Device-stack lifecycle logging (core0) ---------------------------------
+// Mount/unmount/suspend cycles visible in the diagnostic log make PC-side
+// instability (re-enumeration loops, selective suspend) diagnosable from the
+// configurator alone.
+void tud_mount_cb(void)   { dlog0("DSPico device: mounted by PC\n"); }
+void tud_umount_cb(void)  { dlog0("DSPico device: unmounted\n"); }
+void tud_suspend_cb(bool remote_wakeup_en) {
+  (void) remote_wakeup_en;
+  dlog0("DSPico device: suspended by PC\n");
+}
+void tud_resume_cb(void)  { dlog0("DSPico device: resumed\n"); }
 
 // --- Volume / mute state ---------------------------------------------------
 // UAC2 volume is signed 16-bit in 1/256 dB steps. We advertise -60..0 dB.

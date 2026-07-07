@@ -59,6 +59,18 @@ void dlog_task(void) {
   printf("%.*s", (int) avail, tmp);             // mirror to the UART
 }
 
+void dlog0(const char *fmt, ...) {
+  char line[160];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(line, sizeof line, fmt, ap);
+  va_end(ap);
+  if (n <= 0) return;
+  if (n > (int) sizeof line) n = (int) sizeof line;
+  printf("%.*s", n, line);                      // UART immediately
+  for (int i = 0; i < n; i++) ulog_push((uint8_t) line[i]);   // core0-only buffer
+}
+
 uint16_t dlog_usb_read(uint8_t *dst, uint16_t maxlen) {
   uint32_t avail = u_head - u_tail;
   if (avail > maxlen) avail = maxlen;
