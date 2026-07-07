@@ -5,10 +5,11 @@
 // the big caveat: isochronous OUT over the bit-banged PIO port is unproven, so
 // treat this as the scaffold you iterate on with a logic analyzer.
 // ---------------------------------------------------------------------------
-#include "debug_log.h"
 #include <string.h>
 
+#include "pico/time.h"
 #include "tusb.h"
+#include "debug_log.h"
 #include "host/usbh_pvt.h"   // usbh_class_driver_t, usbh_driver_set_config_complete
 #include "board_config.h"
 #include "uac_host.h"
@@ -245,6 +246,59 @@ static void submit_first_packet(void);
 static void on_set_alt_complete(tuh_xfer_t *xfer);
 static void on_set_freq_complete(tuh_xfer_t *xfer);
 
+// --- Setup-chain watchdog ----------------------------------------------------
+// Some DACs NAK forever instead of STALLing a request they dislike; pio_usb
+// retries NAKs indefinitely and TinyUSB has no control-transfer timeout, so a
+// single such request used to wedge the whole chain (seen in the field: a
+// UAC1 sample-rate SET_CUR and a post-STALL Feature-Unit write that never
+// completed). Every chain step arms a deadline; uac_host_task() — called from
+// the core1 loop — aborts the stuck transfer and runs the step's timeout
+// continuation, so setup always terminates.
+#define SETUP_STEP_TIMEOUT_MS 600u
+
+static void (*s_timeout_next)(void);
+static uint32_t s_step_deadline_ms;        // 0 = no step pending
+
+static void arm_step_watchdog(void (*on_timeout)(void)) {
+  s_timeout_next = on_timeout;
+  uint32_t dl = to_ms_since_boot(get_absolute_time()) + SETUP_STEP_TIMEOUT_MS;
+  s_step_deadline_ms = dl ? dl : 1;
+}
+static void disarm_step_watchdog(void) { s_step_deadline_ms = 0; }
+
+void uac_host_task(void) {
+  if (s_step_deadline_ms == 0 || !s_dac.in_use) return;
+  if ((int32_t) (to_ms_since_boot(get_absolute_time()) - s_step_deadline_ms) < 0) return;
+  s_step_deadline_ms = 0;
+  dlog("DSPico host: control step TIMED OUT (device NAKing?) — aborting + continuing\n");
+  tuh_edpt_abort_xfer(s_dac.dev_addr, 0);
+  void (*next)(void) = s_timeout_next;
+  s_timeout_next = NULL;
+  if (next) next();
+}
+
+// Timeout / submit-failure continuations — same forward path the completion
+// handlers take on failure, so a dead step can never strand the chain.
+static bool setup_is_uac2(void);
+static void send_set_interface(void);
+static void start_fu_init(void);
+static void fu_send_next(void);
+static void finish_setup(void);
+
+static void timeout_alt(void) {
+  // Without the operational alt there is nothing to stream to.
+  s_dac.incompatible = true;
+  usbh_driver_set_config_complete(s_dac.dev_addr, s_dac.as_itf);
+}
+static void timeout_rate(void) {
+  // Treat like a stalled rate request: continue — 48 kHz-only DACs don't care.
+  if (setup_is_uac2()) send_set_interface();
+  else                 start_fu_init();
+}
+static void timeout_fu(void) {
+  fu_send_next();   // s_fu_step already advanced — moves to the next control
+}
+
 static bool setup_is_uac2(void) {
   return s_dac.audio_bcd >= 0x0200 && s_dac.clock_id != 0;
 }
@@ -278,6 +332,7 @@ static uint8_t s_fu_buf[2];
 static void fu_send_next(void);
 
 static void on_fu_step_complete(tuh_xfer_t *xfer) {
+  disarm_step_watchdog();
   const uint8_t i = s_fu_step - 1;
   dlog("DSPico host: FU %u %s ch%u -> %s\n", s_dac.fu_id,
          s_fu_steps[i].sel == AUDIO_FU_CTRL_MUTE ? "unmute" : "vol -12dB",
@@ -312,7 +367,9 @@ static void fu_send_next(void) {
       .complete_cb = on_fu_step_complete,
       .user_data = 0,
   };
-  if (!tuh_control_xfer(&xfer)) {
+  if (tuh_control_xfer(&xfer)) {
+    arm_step_watchdog(timeout_fu);
+  } else {
     // Submit refused (control pipe busy/gone): don't strand the chain — the
     // stream matters more than the volume preset.
     dlog("DSPico host: FU step submit failed — skipping volume init\n");
@@ -333,6 +390,7 @@ static void start_fu_init(void) {
 
 // Final step for both protocols: open the iso OUT endpoint and start pumping.
 static void finish_setup(void) {
+  disarm_step_watchdog();
   if (tuh_edpt_open(s_dac.dev_addr, &s_dac.ep_out)) {
     s_dac.streaming = true;
     dlog("DSPico host: streaming started (EP 0x%02X, %u-byte subslot)\n",
@@ -365,7 +423,12 @@ static void send_set_interface(void) {
       .complete_cb = on_set_alt_complete,
       .user_data = 0,
   };
-  tuh_control_xfer(&xfer);
+  if (tuh_control_xfer(&xfer)) {
+    arm_step_watchdog(timeout_alt);
+  } else {
+    dlog("DSPico host: SET_INTERFACE submit failed\n");
+    timeout_alt();
+  }
 }
 
 // UAC2: SET_CUR sample frequency on the Clock Source entity.
@@ -393,7 +456,12 @@ static void send_set_sample_rate_uac2(void) {
       .complete_cb = on_set_freq_complete,
       .user_data = 0,
   };
-  tuh_control_xfer(&xfer);
+  if (tuh_control_xfer(&xfer)) {
+    arm_step_watchdog(timeout_rate);
+  } else {
+    dlog("DSPico host: set-rate submit failed\n");
+    timeout_rate();
+  }
 }
 
 // UAC1: SET_CUR sampling frequency (SAMPLING_FREQ_CONTROL) on the iso endpoint.
@@ -420,7 +488,12 @@ static void send_set_sample_rate_uac1(void) {
       .complete_cb = on_set_freq_complete,
       .user_data = 0,
   };
-  tuh_control_xfer(&xfer);
+  if (tuh_control_xfer(&xfer)) {
+    arm_step_watchdog(timeout_rate);
+  } else {
+    dlog("DSPico host: set-rate submit failed\n");
+    timeout_rate();
+  }
 }
 
 static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
@@ -459,6 +532,7 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
 }
 
 static void on_set_alt_complete(tuh_xfer_t *xfer) {
+  disarm_step_watchdog();
   dlog("DSPico host: SET_INTERFACE(itf %u, alt %u) -> %s\n",
          s_dac.as_itf, s_dac.as_alt,
          xfer->result == XFER_RESULT_SUCCESS ? "OK" : "FAILED");
@@ -475,6 +549,7 @@ static void on_set_alt_complete(tuh_xfer_t *xfer) {
 }
 
 static void on_set_freq_complete(tuh_xfer_t *xfer) {
+  disarm_step_watchdog();
   // A DAC that only supports 48 kHz may STALL the set-rate request; that's
   // fine — its fixed rate is the one we want anyway. Log it either way.
   dlog("DSPico host: SET sample rate 48000 -> %s\n",
@@ -542,8 +617,11 @@ static void on_iso_complete(tuh_xfer_t *xfer) {
   if (xfer->daddr != s_dac.dev_addr) return;
   static uint32_t pkts;
   if ((++pkts & 0x1FFF) == 0) {   // every 8192 packets ≈ 8 s
-    dlog("DSPico host: streaming heartbeat — %lu iso packets sent\n",
-           (unsigned long) pkts);
+    // Ring fill says where a silence problem lives: ~0 with the PC playing
+    // means PC audio isn't arriving (device side); large+stable means the
+    // path is healthy and any silence is downstream of us.
+    dlog("DSPico host: heartbeat — %lu iso pkts sent, play ring %lu B\n",
+           (unsigned long) pkts, (unsigned long) signal_path_play_fill());
   }
   submit_packet();
 }
@@ -558,6 +636,7 @@ static bool dac_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result,
 
 static void dac_close(uint8_t dev_addr) {
   if (dev_addr != s_dac.dev_addr) return;
+  disarm_step_watchdog();
   dlog("DSPico host: DAC disconnected\n");
   memset(&s_dac, 0, sizeof(s_dac));
 }

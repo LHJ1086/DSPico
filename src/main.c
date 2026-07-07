@@ -83,6 +83,7 @@ static void core1_main(void) {
 
   for (;;) {
     tuh_task();
+    uac_host_task();   // watchdog for DAC control transfers that NAK forever
   }
 }
 

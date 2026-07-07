@@ -126,3 +126,4 @@ void signal_path_set_band(uint8_t idx, const peq_band_t *band) {
   peq_set_band(&s_peq, idx, band);
 }
 peq_t *signal_path_peq(void) { return &s_peq; }
+uint32_t signal_path_play_fill(void) { return audio_ring_used(&s_play); }

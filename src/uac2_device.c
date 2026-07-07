@@ -73,6 +73,7 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
 
   if (itf == ITF_NUM_AUDIO_STREAMING) {
     const bool on = (alt != 0);   // alt 1 = operational, alt 0 = zero bandwidth
+    dlog0("DSPico device: PC stream %s (alt %u)\n", on ? "OPEN" : "closed", alt);
     if (on) {
       signal_path_on_stream_start();               // clear filter history
       signal_path_set_host_gain(uac2_host_gain()); // apply current volume/mute
@@ -107,6 +108,14 @@ bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received,
     if (got == 0) break;
     remaining -= got;
     signal_path_push_capture(scratch, got);   // EQ + enqueue toward the DAC
+  }
+
+  // Inbound heartbeat (~8 s): proves PC audio is actually reaching us, and
+  // the ring fill shows whether the DAC side is draining it.
+  static uint32_t rx_pkts;
+  if ((++rx_pkts & 0x1FFF) == 0) {
+    dlog0("DSPico device: RX heartbeat — %lu pkts from PC, play ring %lu B\n",
+          (unsigned long) rx_pkts, (unsigned long) signal_path_play_fill());
   }
   return true;
 }

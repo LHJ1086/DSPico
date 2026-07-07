@@ -43,4 +43,8 @@ typedef enum {
 
 uac_host_state_t uac_host_state(void);
 
+// Call from the core1 loop next to tuh_task(): runs the setup-chain watchdog
+// that aborts control transfers a quirky DAC NAKs forever.
+void uac_host_task(void);
+
 #endif // DSPICO_UAC_HOST_H

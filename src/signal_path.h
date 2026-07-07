@@ -50,4 +50,7 @@ void signal_path_set_band(uint8_t idx, const peq_band_t *band);
 // Direct access for the (future) config/query surface. Same-core use only.
 peq_t *signal_path_peq(void);
 
+// Bytes currently queued toward the DAC (safe from either core) — diagnostics.
+uint32_t signal_path_play_fill(void);
+
 #endif // DSPICO_SIGNAL_PATH_H
