@@ -4,6 +4,10 @@
 // ===========================================================================
 'use strict';
 
+// Bumped on every configurator change and printed in the Ready line, so a
+// stale/cached deployment is immediately visible in any pasted log.
+const APP_REV = 'r8';
+
 // --- Shared protocol contract (keep in sync with the firmware) --------------
 const PROTO = {
   ITF_VENDOR: 2,            // vendor interface number in the composite device
@@ -283,25 +287,50 @@ function connectHint(step, err){
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const DSPICO_FILTER = { vendorId: 0x1209, productId: 0xD590 };
 
-async function connect(){
+// A device object already granted permission (no chooser needed), or null.
+async function getPermittedDevice(){
+  const devs = await navigator.usb.getDevices();
+  return devs.find(d => d.vendorId === DSPICO_FILTER.vendorId &&
+                        d.productId === DSPICO_FILTER.productId) || null;
+}
+
+// Open with recovery. "An operation that changes interface state is in
+// progress" / "device disconnected" mean a stale handle or an OS
+// re-enumeration mid-flight: back off, fetch a FRESH device object from
+// getDevices() (the old object can be permanently poisoned), and try again.
+async function openWithRetry(dev){
+  for (let attempt = 0; ; attempt++) {
+    try { await dev.open(); return dev; }
+    catch (e) {
+      const transient = e.name === 'InvalidStateError' || e.name === 'NotFoundError' ||
+                        /disconnected|in progress/i.test(e.message);
+      if (attempt >= 4 || !transient) throw e;
+      log(`open busy (${e.name}), retry ${attempt + 1}/4…`);
+      try { await dev.close(); } catch (_) {}
+      await sleep(700);
+      const fresh = await getPermittedDevice();
+      if (fresh) dev = fresh;
+    }
+  }
+}
+
+// interactive=true shows the chooser; false silently uses an already
+// permitted device (auto-connect on load / on replug).
+let connectInFlight = false;
+async function connect(interactive = true){
   if (!('usb' in navigator)) { log('WebUSB not available — use Chrome/Edge over https or localhost.', 'e'); return; }
+  if (connectInFlight || usbDevice) return;   // one attempt at a time
+  connectInFlight = true;
   let step = 'requestDevice';
   try {
-    usbDevice = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x1209, productId: 0xD590 }] });
-    step = 'open';
-    // "An operation that changes interface state is in progress" /
-    // "The device was disconnected": a previous close() or an OS re-enumerate
-    // is still settling. Back off briefly and retry a couple of times before
-    // giving up — this makes replug + immediate Connect just work.
-    for (let attempt = 0; ; attempt++) {
-      try { await usbDevice.open(); break; }
-      catch (e) {
-        if (attempt >= 2 || (e.name !== 'InvalidStateError' && e.name !== 'NotFoundError')) throw e;
-        log(`open busy (${e.name}) — retrying…`);
-        await sleep(600);
-      }
+    let dev = await getPermittedDevice();
+    if (!dev) {
+      if (!interactive) return;                 // nothing permitted yet — stay quiet
+      dev = await navigator.usb.requestDevice({ filters: [DSPICO_FILTER] });
     }
+    step = 'open';           usbDevice = await openWithRetry(dev);
     step = 'selectConfiguration';
     if (usbDevice.configuration === null) await usbDevice.selectConfiguration(1);
     step = 'claimInterface'; await usbDevice.claimInterface(PROTO.ITF_VENDOR);
@@ -313,6 +342,8 @@ async function connect(){
     setConnected(false);
     try { if (usbDevice) await usbDevice.close(); } catch (_) {}
     usbDevice = null;
+  } finally {
+    connectInFlight = false;
   }
 }
 
@@ -477,10 +508,41 @@ $('btnExport').onclick = ()=>{
   a.download='dspico-preset.json'; a.click(); URL.revokeObjectURL(a.href);
 };
 
+// ---- Log utilities -----------------------------------------------------
+$('btnCopyLog').onclick = async ()=>{
+  try { await navigator.clipboard.writeText($('log').textContent); log('Log copied to clipboard.'); }
+  catch (e) { log('Copy failed: ' + e.message, 'e'); }
+};
+$('btnClearLog').onclick = ()=>{ $('log').textContent = ''; };
+
+// ---- Plug/unplug awareness + auto-connect --------------------------------
+if ('usb' in navigator) {
+  navigator.usb.addEventListener('disconnect', (e)=>{
+    if (usbDevice && e.device === usbDevice) {
+      usbDevice = null;
+      setConnected(false);
+      log('Device unplugged.');
+    }
+  });
+  navigator.usb.addEventListener('connect', async (e)=>{
+    if (!usbDevice &&
+        e.device.vendorId === DSPICO_FILTER.vendorId &&
+        e.device.productId === DSPICO_FILTER.productId) {
+      log('DSPico plugged in — connecting…');
+      await sleep(800);          // let the OS finish binding drivers
+      connect(false);
+    }
+  });
+}
+
 // Seed with a couple of example bands so the graph isn't empty.
 state.bands = [ newBand({type:TYPE.LOWSHELF, fc:105, gain:4, q:0.7}),
                 newBand({type:TYPE.PEAKING, fc:3000, gain:-3, q:1.5}) ];
 renderBands();
-log('Ready. Design offline, or Connect a DSPico to push live.');
+log(`Ready — configurator ${APP_REV}. Design offline, or Connect a DSPico to push live.`);
+
+// Reconnect silently if this browser already has permission for a DSPico.
+getPermittedDevice().then(d => { if (d) { log('Found permitted DSPico — auto-connecting…'); connect(false); } })
+                    .catch(()=>{});
 
 } // end browser-only block
