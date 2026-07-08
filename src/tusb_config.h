@@ -36,7 +36,13 @@ extern "C" {
 // (dspico_tusb_printf) drops HOST-stack (core1) trace entirely, protecting the
 // timing-critical PIO-USB path. DSPICO_USB_TRACE is defined in board_config.h
 // (included above); set it to 0 there to return to a quiet production build.
-#if DSPICO_USB_TRACE
+// The verbose TinyUSB internal trace served its purpose (it showed the PC does
+// reach SET_INTERFACE(alt 1)) but floods the log. Keep DSPICO_USB_TRACE for the
+// host-side log-silencing gates in uac_host.c, but drop the verbose device
+// trace — our own targeted markers in uac2_device.c are enough now and far
+// quieter. Flip USE_TINYUSB_VERBOSE_TRACE to 1 to bring the full trace back.
+#define USE_TINYUSB_VERBOSE_TRACE 0
+#if USE_TINYUSB_VERBOSE_TRACE
 #undef  CFG_TUSB_DEBUG
 #define CFG_TUSB_DEBUG      2
 #define CFG_TUD_LOG_LEVEL   2      // device stack: verbose (what we want to see)

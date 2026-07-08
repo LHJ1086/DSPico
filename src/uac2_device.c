@@ -73,6 +73,11 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
   const uint8_t itf = TU_U16_LOW(p_request->wIndex);
   const uint8_t alt = TU_U16_LOW(p_request->wValue);
 
+  // Unconditional entry marker: proves whether TinyUSB actually reaches our
+  // alt-set callback (the trace shows the PC sends SET_INTERFACE, but streaming
+  // never turned on — this pins down whether the callback itself is invoked).
+  dlog0("DSPico device: >>> set_itf_cb itf=%u alt=%u\n", itf, alt);
+
   if (itf == ITF_NUM_AUDIO_STREAMING) {
     const bool on = (alt != 0);   // alt 1 = operational, alt 0 = zero bandwidth
     dlog0("DSPico device: PC stream %s (alt %u)\n", on ? "OPEN" : "closed", alt);
