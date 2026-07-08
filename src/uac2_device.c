@@ -261,11 +261,24 @@ bool tud_audio_set_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p
   if (ctrl_sel == AUDIO_FU_CTRL_MUTE) {
     s_mute[channel] = ((audio_control_cur_1_t const *) buf)->bCur;
     signal_path_set_host_gain(uac2_host_gain());
+    // Log it so "does the PC's mute button reach us?" is answerable from the
+    // WebUSB/UART log alone. gain is reported in milli-units (no float print).
+    dlog0("DSPico device: PC set MUTE ch%u=%u -> master gain %lu/1000\n",
+          channel, (unsigned) s_mute[channel],
+          (unsigned long) (uac2_host_gain() * 1000.0f));
     return true;
   }
   if (ctrl_sel == AUDIO_FU_CTRL_VOLUME) {
     s_volume_db256[channel] = (int16_t) tu_le16toh(((audio_control_cur_2_t const *) buf)->bCur);
     signal_path_set_host_gain(uac2_host_gain());
+    // dB shown as signed value + 2 decimals from the 1/256 dB fixed point.
+    // Sign is carried explicitly so -0.xx dB doesn't print as +0.xx.
+    const int32_t  q    = s_volume_db256[channel];
+    const uint32_t mag  = (uint32_t) (q < 0 ? -q : q);
+    dlog0("DSPico device: PC set VOL ch%u=%s%lu.%02lu dB -> master gain %lu/1000\n",
+          channel, q < 0 ? "-" : "",
+          (unsigned long) (mag / 256), (unsigned long) (mag % 256) * 100u / 256u,
+          (unsigned long) (uac2_host_gain() * 1000.0f));
     return true;
   }
   return false;

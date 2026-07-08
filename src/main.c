@@ -5,9 +5,10 @@
 //   * core1: Pico-PIO-USB HOST  -> downstream USB DAC (tight bit timing)
 //   * core0: native USB DEVICE (UAC2 speaker) + app/DSP
 //
-// Phase 1b streams a firmware-generated test tone to the DAC; the device side
-// enumerates as a UAC2 output and discards received audio. Stop here for the
-// hardware go/no-go gate before wiring the two together (Phase 2).
+// The full bridge is wired: the device side enumerates as a UAC2 output, and
+// PC audio is EQ'd and streamed on to the downstream DAC (audio_source below).
+// A firmware-generated test tone feeds the DAC whenever no PC is streaming, so
+// the DAC stays fed for bring-up with nothing attached upstream.
 // ---------------------------------------------------------------------------
 #include <stdio.h>
 #include <string.h>
