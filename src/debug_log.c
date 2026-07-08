@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+#include "pico.h"            // get_core_num()
 #include "debug_log.h"
 
 // --- core1 -> core0 ring (SPSC, acquire/release like audio_ring.h) ----------
@@ -35,7 +36,7 @@ void dlog(const char *fmt, ...) {
 }
 
 // --- core0-only buffer feeding the WebUSB log read --------------------------
-#define ULOG_CAP 4096u
+#define ULOG_CAP 8192u   // roomy so a burst of USB trace can't evict key lines
 static uint8_t  u_buf[ULOG_CAP];
 static uint32_t u_head, u_tail;
 
@@ -69,6 +70,25 @@ void dlog0(const char *fmt, ...) {
   if (n > (int) sizeof line) n = (int) sizeof line;
   printf("%.*s", n, line);                      // UART immediately
   for (int i = 0; i < n; i++) ulog_push((uint8_t) line[i]);   // core0-only buffer
+}
+
+// TinyUSB internal-trace sink (wired via CFG_TUSB_DEBUG_PRINTF). The DEVICE
+// stack runs on core0, so its trace goes straight to the WebUSB log buffer to
+// expose SET_INTERFACE / endpoint-open behaviour during bring-up. HOST-stack
+// trace (core1) is dropped before any formatting so it cannot add latency to
+// the timing-critical PIO-USB path.
+int dspico_tusb_printf(const char *fmt, ...) {
+  if (get_core_num() != 0) return 0;            // drop host (core1) trace
+  char line[160];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(line, sizeof line, fmt, ap);
+  va_end(ap);
+  if (n <= 0) return 0;
+  if (n > (int) sizeof line) n = (int) sizeof line;
+  printf("%.*s", n, line);                      // UART
+  for (int i = 0; i < n; i++) ulog_push((uint8_t) line[i]);   // WebUSB log
+  return n;
 }
 
 uint16_t dlog_usb_read(uint8_t *dst, uint16_t maxlen) {

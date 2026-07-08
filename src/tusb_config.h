@@ -30,8 +30,27 @@ extern "C" {
 #define CFG_TUSB_OS OPT_OS_PICO
 #endif
 
+// Bring-up diagnostic: route TinyUSB's DEVICE-side internal trace (SET_INTERFACE,
+// endpoint open, control requests) into the WebUSB log so we can see whether the
+// PC ever activates the audio stream and, if it fails, where. The sink
+// (dspico_tusb_printf) drops HOST-stack (core1) trace entirely, protecting the
+// timing-critical PIO-USB path. Set DSPICO_USB_TRACE to 0 to return to a quiet
+// production build.
+#ifndef DSPICO_USB_TRACE
+#define DSPICO_USB_TRACE 1
+#endif
+
+#if DSPICO_USB_TRACE
+#undef  CFG_TUSB_DEBUG
+#define CFG_TUSB_DEBUG      2
+#define CFG_TUD_LOG_LEVEL   2      // device stack: verbose (what we want to see)
+#define CFG_TUH_LOG_LEVEL   0      // host stack: silent (protect core1 timing)
+extern int dspico_tusb_printf(const char *fmt, ...);
+#define CFG_TUSB_DEBUG_PRINTF dspico_tusb_printf
+#else
 #ifndef CFG_TUSB_DEBUG
 #define CFG_TUSB_DEBUG 0
+#endif
 #endif
 
 // Both native and PIO ports are Full Speed only (brief §2).
