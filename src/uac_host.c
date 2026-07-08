@@ -48,10 +48,21 @@ typedef struct {
 
   // Feature Unit discovery, to unmute/set volume on the DAC's playback path
   // (real hosts always do this; DACs may power up muted or at minimum volume).
+  // fu_ctrl[i][ch] holds the low byte of that FU's bmaControls for the channel
+  // (bits 0-1 = Mute, bits 2-3 = Volume; 0b11 = host-writable). We send a
+  // control ONLY where it exists: the CX31988 puts Mute on the master and
+  // Volume on L/R only, and NAKs forever on a write to a control it lacks —
+  // which used to wedge the very volume writes that unmute it, so it stayed
+  // silent. FU_MAX_CH covers master + stereo.
+#define FU_MAX_CH 3
   uint8_t  fu_ids[8];       // every Feature Unit seen in the AC block
+  uint8_t  fu_ctrl[8][FU_MAX_CH];
+  uint8_t  fu_nch[8];       // channels (incl. master) recorded for each FU
   uint8_t  fu_count;
   uint8_t  ot_source_id;    // bSourceID of the speaker/headphone Output Terminal
   uint8_t  fu_id;           // the FU we drive (resolved in dac_set_config)
+  uint8_t  fu_ctrl_sel[FU_MAX_CH];   // control map of the resolved fu_id
+  uint8_t  fu_ctrl_nch;              // its channel count
 
   uint8_t  as_itf;          // Audio Streaming interface number
   uint8_t  as_alt;          // operational alt setting (has the iso EP)
@@ -270,7 +281,22 @@ static void parse_audio_function(dac_dev_t *d, uint8_t const *p, uint16_t len) {
       } else if (subtype == AUDIO_CS_AC_INTERFACE_CLOCK_SELECTOR && dlen >= 4) {
         d->clock_sel_id = p[3];                        // bClockID of the selector
       } else if (subtype == AUDIO_CS_AC_INTERFACE_FEATURE_UNIT && dlen >= 5) {
-        if (d->fu_count < sizeof(d->fu_ids)) d->fu_ids[d->fu_count++] = p[3];
+        if (d->fu_count < TU_ARRAY_SIZE(d->fu_ids)) {
+          const uint8_t idx = d->fu_count++;
+          d->fu_ids[idx] = p[3];   // bUnitID
+          // UAC2 Feature Unit: bmaControls[ch] is 4 bytes each, starting after
+          // the 5-byte header (bLength,type,subtype,bUnitID,bSourceID), one per
+          // channel including master (ch0). Record the low byte per channel.
+          // (UAC1 uses a bControlSize-based layout; we only build the precise
+          // control map for UAC2, where the NAK-forever quirk was observed.)
+          uint8_t nch = 0;
+          if (d->audio_bcd >= 0x0200 && dlen >= 6) {
+            nch = (uint8_t) ((dlen - 6) / 4);   // trailing byte is iFeature
+            if (nch > FU_MAX_CH) nch = FU_MAX_CH;
+            for (uint8_t c = 0; c < nch; c++) d->fu_ctrl[idx][c] = p[5 + c * 4];
+          }
+          d->fu_nch[idx] = nch;
+        }
       } else if (subtype == AUDIO_CS_AC_INTERFACE_OUTPUT_TERMINAL && dlen >= 8) {
         // Remember the speaker/headphone terminal's source: if that source is
         // a Feature Unit, it's the one controlling playback volume/mute.
@@ -499,8 +525,13 @@ static bool setup_is_uac2(void) {
 // enumeration, and DACs are tested against that — some power up muted or at
 // minimum volume and stay silent forever if nobody does it. The wire format is
 // the same for UAC1 (SET_CUR) and UAC2 (CUR): bRequest 0x01, wValue =
-// (selector << 8) | channel, wIndex = (fu_id << 8) | ac_itf. Controls a DAC
-// doesn't implement simply STALL; every step tolerates that and moves on.
+// (selector << 8) | channel, wIndex = (fu_id << 8) | ac_itf.
+//
+// CRUCIAL (CX31988): send a control ONLY where the FU's bmaControls says it
+// exists. That codec carries Mute on the master and Volume on L/R only, and
+// NAKs FOREVER (never STALLs) on a write to a control it lacks — the NAK storm
+// wedged the very L/R volume writes that raise it off its minimum, so it
+// streamed silently. The step list is now built from the parsed control map.
 static void finish_setup(void);
 
 // Volume target: a modest -12 dB (1/256 dB units) rather than 0 dB — audible
@@ -509,18 +540,38 @@ static void finish_setup(void);
 // attach/detach loop). The OS volume on the PC side still scales the stream.
 #define FU_VOLUME_TARGET ((uint16_t)(int16_t)(-12 * 256))
 
-static const struct { uint8_t sel, ch, len; uint16_t val; } s_fu_steps[] = {
-  { AUDIO_FU_CTRL_MUTE,   0, 1, 0 },
-  { AUDIO_FU_CTRL_MUTE,   1, 1, 0 },
-  { AUDIO_FU_CTRL_MUTE,   2, 1, 0 },
-  { AUDIO_FU_CTRL_VOLUME, 0, 2, FU_VOLUME_TARGET },
-  { AUDIO_FU_CTRL_VOLUME, 1, 2, FU_VOLUME_TARGET },
-  { AUDIO_FU_CTRL_VOLUME, 2, 2, FU_VOLUME_TARGET },
-};
-static uint8_t s_fu_step;
-static uint8_t s_fu_buf[2];
+// The step list, built by build_fu_steps() from the resolved FU's control map.
+// Room for master + stereo, each with a mute and a volume control.
+typedef struct { uint8_t sel, ch, len; uint16_t val; } fu_step_t;
+static fu_step_t s_fu_steps[FU_MAX_CH * 2];
+static uint8_t   s_fu_nsteps;
+static uint8_t   s_fu_step;
+static uint8_t   s_fu_buf[2];
 
 static void fu_send_next(void);
+
+// Turn the resolved FU's control map into the concrete SET_CUR steps to send.
+// For UAC1 (no map parsed) fall back to trying mute+volume on master + stereo,
+// which is what real UAC1 hosts do and what earlier field DACs tolerated.
+static void build_fu_steps(void) {
+  s_fu_nsteps = 0;
+  s_fu_step   = 0;
+  if (s_dac.fu_ctrl_nch == 0) {           // UAC1 / no control map — try the lot
+    for (uint8_t ch = 0; ch < FU_MAX_CH; ch++)
+      s_fu_steps[s_fu_nsteps++] = (fu_step_t){ AUDIO_FU_CTRL_MUTE, ch, 1, 0 };
+    for (uint8_t ch = 0; ch < FU_MAX_CH; ch++)
+      s_fu_steps[s_fu_nsteps++] = (fu_step_t){ AUDIO_FU_CTRL_VOLUME, ch, 2, FU_VOLUME_TARGET };
+    return;
+  }
+  // UAC2: emit only controls the FU actually implements (bits 0-1 Mute,
+  // bits 2-3 Volume; non-zero = present).
+  for (uint8_t ch = 0; ch < s_dac.fu_ctrl_nch; ch++)
+    if (s_dac.fu_ctrl_sel[ch] & 0x03)
+      s_fu_steps[s_fu_nsteps++] = (fu_step_t){ AUDIO_FU_CTRL_MUTE, ch, 1, 0 };
+  for (uint8_t ch = 0; ch < s_dac.fu_ctrl_nch; ch++)
+    if (s_dac.fu_ctrl_sel[ch] & 0x0C)
+      s_fu_steps[s_fu_nsteps++] = (fu_step_t){ AUDIO_FU_CTRL_VOLUME, ch, 2, FU_VOLUME_TARGET };
+}
 
 static void on_fu_step_complete(tuh_xfer_t *xfer) {
   if (stale_completion(xfer)) return;
@@ -534,7 +585,7 @@ static void on_fu_step_complete(tuh_xfer_t *xfer) {
 }
 
 static void fu_send_next(void) {
-  if (s_dac.fu_id == 0 || s_fu_step >= TU_ARRAY_SIZE(s_fu_steps)) {
+  if (s_dac.fu_id == 0 || s_fu_step >= s_fu_nsteps) {
     finish_setup();
     return;
   }
@@ -570,10 +621,17 @@ static void fu_send_next(void) {
 }
 
 static void start_fu_init(void) {
-  s_fu_step = 0;
+  build_fu_steps();
   if (s_dac.fu_id) {
-    dlog("DSPico host: initialising DAC Feature Unit %u (unmute + vol -12 dB)\n",
-           s_dac.fu_id);
+    dlog("DSPico host: initialising DAC Feature Unit %u — %u controls to set "
+         "(map: m%c/v%c m%c/v%c m%c/v%c)\n",
+           s_dac.fu_id, s_fu_nsteps,
+           (s_dac.fu_ctrl_nch > 0 && (s_dac.fu_ctrl_sel[0] & 0x03)) ? 'Y' : '-',
+           (s_dac.fu_ctrl_nch > 0 && (s_dac.fu_ctrl_sel[0] & 0x0C)) ? 'Y' : '-',
+           (s_dac.fu_ctrl_nch > 1 && (s_dac.fu_ctrl_sel[1] & 0x03)) ? 'Y' : '-',
+           (s_dac.fu_ctrl_nch > 1 && (s_dac.fu_ctrl_sel[1] & 0x0C)) ? 'Y' : '-',
+           (s_dac.fu_ctrl_nch > 2 && (s_dac.fu_ctrl_sel[2] & 0x03)) ? 'Y' : '-',
+           (s_dac.fu_ctrl_nch > 2 && (s_dac.fu_ctrl_sel[2] & 0x0C)) ? 'Y' : '-');
   } else {
     dlog("DSPico host: no Feature Unit found — skipping volume init\n");
   }
@@ -778,10 +836,19 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
   // Resolve the playback Feature Unit for the volume-init step: prefer the
   // unit that feeds the speaker/headphone Output Terminal, else the first.
   s_dac.fu_id = 0;
+  uint8_t fu_idx = 0xFF;
   for (uint8_t i = 0; i < s_dac.fu_count; i++) {
-    if (s_dac.fu_ids[i] == s_dac.ot_source_id) { s_dac.fu_id = s_dac.ot_source_id; break; }
+    if (s_dac.fu_ids[i] == s_dac.ot_source_id) { s_dac.fu_id = s_dac.ot_source_id; fu_idx = i; break; }
   }
-  if (s_dac.fu_id == 0 && s_dac.fu_count > 0) s_dac.fu_id = s_dac.fu_ids[0];
+  if (s_dac.fu_id == 0 && s_dac.fu_count > 0) { s_dac.fu_id = s_dac.fu_ids[0]; fu_idx = 0; }
+
+  // Copy the chosen FU's control map so the step builder sends only controls
+  // that exist (see build_fu_steps / the CX31988 note).
+  s_dac.fu_ctrl_nch = 0;
+  if (fu_idx != 0xFF) {
+    s_dac.fu_ctrl_nch = s_dac.fu_nch[fu_idx];
+    memcpy(s_dac.fu_ctrl_sel, s_dac.fu_ctrl[fu_idx], FU_MAX_CH);
+  }
 
   // Kick the setup chain (see the ordering note above).
   s_rate_tries = 0;
