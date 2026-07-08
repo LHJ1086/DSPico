@@ -89,6 +89,7 @@ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const 
   (void) rhport;
   const uint8_t itf = TU_U16_LOW(p_request->wIndex);
   if (itf == ITF_NUM_AUDIO_STREAMING) {
+    dlog0("DSPico device: stream EP close (itf %u)\n", itf);
     set_streaming(false);
   }
   return true;

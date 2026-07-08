@@ -14,6 +14,14 @@
 #ifndef DSPICO_BOARD_CONFIG_H
 #define DSPICO_BOARD_CONFIG_H
 
+// Bring-up USB trace (see tusb_config.h). When on, the host-side (core1) log
+// bursts — the DAC descriptor dump and per-stream heartbeat — are silenced so
+// they don't byte-interleave with and garble the device-side (core0) trace we
+// are trying to read. Set to 0 for a normal build.
+#ifndef DSPICO_USB_TRACE
+#define DSPICO_USB_TRACE 1
+#endif
+
 // --- System clock ----------------------------------------------------------
 // Pico-PIO-USB requires a 120 MHz-derived clock for correct Full-Speed bit
 // timing. Do NOT change this to an arbitrary frequency (brief §4). 240 MHz is

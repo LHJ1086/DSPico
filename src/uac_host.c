@@ -369,7 +369,9 @@ static bool dac_open(uint8_t rhport, uint8_t dev_addr,
   s_dac.rhport = rhport;
 
   // Capture the descriptor block for the incremental hex dump (first call only —
-  // UAC1 without an IAD calls open() once per interface).
+  // UAC1 without an IAD calls open() once per interface). Suppressed while the
+  // USB device-trace is on, so the dump burst can't garble the device log.
+#if !DSPICO_USB_TRACE
   if (s_desc_len == 0) {
     uint16_t n = max_len < UAC_DESC_DUMP_MAX ? max_len : UAC_DESC_DUMP_MAX;
     memcpy(s_desc_dump, itf_desc, n);
@@ -377,6 +379,7 @@ static bool dac_open(uint8_t rhport, uint8_t dev_addr,
     s_desc_pos = 0;
     dlog("DSPico host: dumping %u-byte audio descriptor block:\n", n);
   }
+#endif
 
   parse_audio_function(&s_dac, (uint8_t const *) itf_desc, max_len);
   return true;   // claim the audio interface(s) in this block
@@ -966,6 +969,7 @@ static void submit_first_packet(void) { submit_packet(); }
 // packets are actually flowing (~1000/s expected at 48 kHz).
 static void on_iso_complete(tuh_xfer_t *xfer) {
   if (xfer->daddr != s_dac.dev_addr) return;
+#if !DSPICO_USB_TRACE
   if ((++s_iso_pkts & 0x1FFF) == 0) {   // every 8192 packets ≈ 8 s
     // Rate must sit at ~1000 pkts/s (one per USB frame). Ring fill says where
     // a silence problem lives: ~0 with the PC playing means PC audio isn't
@@ -977,6 +981,7 @@ static void on_iso_complete(tuh_xfer_t *xfer) {
            (unsigned long) (ms ? (uint64_t) s_iso_pkts * 1000u / ms : 0),
            (unsigned long) signal_path_play_fill());
   }
+#endif
   submit_packet();
 }
 

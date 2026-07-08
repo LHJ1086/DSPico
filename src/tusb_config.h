@@ -34,12 +34,8 @@ extern "C" {
 // endpoint open, control requests) into the WebUSB log so we can see whether the
 // PC ever activates the audio stream and, if it fails, where. The sink
 // (dspico_tusb_printf) drops HOST-stack (core1) trace entirely, protecting the
-// timing-critical PIO-USB path. Set DSPICO_USB_TRACE to 0 to return to a quiet
-// production build.
-#ifndef DSPICO_USB_TRACE
-#define DSPICO_USB_TRACE 1
-#endif
-
+// timing-critical PIO-USB path. DSPICO_USB_TRACE is defined in board_config.h
+// (included above); set it to 0 there to return to a quiet production build.
 #if DSPICO_USB_TRACE
 #undef  CFG_TUSB_DEBUG
 #define CFG_TUSB_DEBUG      2
