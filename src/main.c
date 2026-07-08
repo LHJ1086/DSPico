@@ -148,6 +148,7 @@ int main(void) {
   for (;;) {
     tud_task();
     uac2_feedback_task();// async feedback from the play-ring fill (uac2_device.c)
+    uac2_device_task();  // periodic device stream/RX status heartbeat
     config_usb_task();   // deferred flash commit (too slow for a USB callback)
     dlog_task();         // forward core1 host diagnostics to UART + WebUSB log
 

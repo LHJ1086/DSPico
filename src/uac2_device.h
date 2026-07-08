@@ -2,8 +2,8 @@
 // DSPico — UAC2 device side (Phase 1a, brief §8)
 //
 // Owns the volume/mute state and the audio-class control-request handling for
-// the native (PC-facing) USB device. In Phase 1a received audio is drained and
-// discarded; Phase 2 will forward it into the capture ring instead.
+// the native (PC-facing) USB device. Received audio is EQ'd and forwarded to
+// the play ring toward the downstream DAC (see tud_audio_rx_done_post_read_cb).
 // ---------------------------------------------------------------------------
 #ifndef DSPICO_UAC2_DEVICE_H
 #define DSPICO_UAC2_DEVICE_H
@@ -21,5 +21,9 @@ float uac2_host_gain(void);
 // Call from the core0 main loop: recomputes the async-feedback value from the
 // play ring's fill level so the PC's send rate tracks the DAC's drain rate.
 void uac2_feedback_task(void);
+
+// Call from the core0 main loop: periodic device-side status heartbeat
+// (mount/stream state + bytes received from the PC) for field diagnosis.
+void uac2_device_task(void);
 
 #endif // DSPICO_UAC2_DEVICE_H

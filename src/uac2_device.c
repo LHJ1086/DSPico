@@ -98,6 +98,12 @@ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const 
 // Received audio: run it through the on-device signal path (pre-gain -> PEQ ->
 // host volume) and push it to the play ring for the DAC (brief §5).
 // ---------------------------------------------------------------------------
+// Cumulative bytes received from the PC — surfaced by the device heartbeat so
+// "is the PC actually streaming?" is answerable even if the stream-open
+// transition line was lost to a busy log ring (e.g. during the host-side
+// descriptor dump).
+static uint32_t s_rx_total_bytes;
+
 bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received,
                                     uint8_t func_id, uint8_t ep_out, uint8_t cur_alt_setting) {
   (void) rhport; (void) func_id; (void) ep_out; (void) cur_alt_setting;
@@ -111,15 +117,28 @@ bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received,
     remaining -= got;
     signal_path_push_capture(scratch, got);   // EQ + enqueue toward the DAC
   }
-
-  // Inbound heartbeat (~8 s): proves PC audio is actually reaching us, and
-  // the ring fill shows whether the DAC side is draining it.
-  static uint32_t rx_pkts;
-  if ((++rx_pkts & 0x1FFF) == 0) {
-    dlog0("DSPico device: RX heartbeat — %lu pkts from PC, play ring %lu B\n",
-          (unsigned long) rx_pkts, (unsigned long) signal_path_play_fill());
-  }
+  s_rx_total_bytes += n_bytes_received;
   return true;
+}
+
+// Periodic device-side status (call from the core0 main loop). Logs every few
+// seconds whether the PC has opened the stream and how much audio it has sent —
+// the decisive datapoint for "music won't play": streaming=0 forever means the
+// PC never activated our OUT stream; streaming=1 with rx climbing means audio
+// is arriving and any silence is downstream.
+void uac2_device_task(void) {
+  static uint32_t last_ms;
+  static uint32_t last_rx;
+  const uint32_t now = to_ms_since_boot(get_absolute_time());
+  if (now - last_ms < 3000) return;
+  last_ms = now;
+
+  const uint32_t rx = s_rx_total_bytes;
+  dlog0("DSPico device: state — mounted=%d streaming=%d rx=%lu B (+%lu) ring=%lu B\n",
+        (int) tud_mounted(), (int) uac2_is_streaming(),
+        (unsigned long) rx, (unsigned long) (rx - last_rx),
+        (unsigned long) signal_path_play_fill());
+  last_rx = rx;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +272,21 @@ bool tud_audio_set_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p
   const uint8_t entity_id = TU_U16_HIGH(p_request->wIndex);
   const uint8_t ctrl_sel  = TU_U16_HIGH(p_request->wValue);
   const uint8_t channel   = TU_U16_LOW(p_request->wValue);
+
+  // Some hosts issue SET_CUR(sample freq) on the Clock Source during stream
+  // startup even though we advertise the frequency control read-only. STALLing
+  // it can make the host abort before it ever opens the AS interface (so the
+  // stream never starts and only the fall-back test tone is heard). Accept it
+  // as a no-op — our single supported rate is the only one RANGE allows anyway.
+  if (entity_id == UAC2_ENTITY_CLOCK) {
+    if (ctrl_sel == AUDIO_CS_CTRL_SAM_FREQ && p_request->bRequest == AUDIO_CS_REQ_CUR) {
+      const uint32_t hz = tu_le32toh(((audio_control_cur_4_t const *) buf)->bCur);
+      dlog0("DSPico device: PC SET clock freq=%lu Hz (fixed 48000, accepted)\n",
+            (unsigned long) hz);
+      return true;
+    }
+    return false;
+  }
 
   if (entity_id != UAC2_ENTITY_FEATURE_UNIT) return false;
   if (channel > DSPICO_NUM_CHANNELS) return false;
