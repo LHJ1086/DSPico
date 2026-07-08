@@ -92,11 +92,18 @@ static uint8_t const desc_configuration[] = {
     TUD_AUDIO_DESC_CS_AC(/*_bcdADC*/ 0x0200, /*_category*/ AUDIO_FUNC_DESKTOP_SPEAKER,
                          /*_totallen*/ UAC2_CS_AC_TOTAL_LEN, /*_ctrl*/ AUDIO_CTRL_NONE),
 
-    // --- Clock Source: internal, fixed 48 kHz, frequency read-only ----------
+    // --- Clock Source: internal 48 kHz, frequency host-programmable ----------
+    // Advertised as a PROGRAMMABLE clock with a READ/WRITE frequency control,
+    // matching TinyUSB's proven uac2_speaker_fb example. Windows' usbaudio2.sys
+    // programs the sample rate as part of opening the stream; a read-only fixed
+    // clock it cannot set is a known reason it silently declines to stream (the
+    // "device mounts + volume works but never streams" symptom). We still
+    // support only 48 kHz — the RANGE request pins the host to it, and the
+    // SET_CUR handler in uac2_device.c accepts that one value.
     TUD_AUDIO_DESC_CLK_SRC(/*_clkid*/ UAC2_ENTITY_CLOCK,
-                           /*_attr*/ AUDIO_CLOCK_SOURCE_ATT_INT_FIX_CLK,
-                           /*_ctrl*/ (AUDIO_CTRL_R << AUDIO_CLOCK_SOURCE_CTRL_CLK_FRQ_POS),
-                           /*_assocTerm*/ 0x00, /*_stridx*/ 0x00),
+                           /*_attr*/ AUDIO_CLOCK_SOURCE_ATT_INT_PRO_CLK,
+                           /*_ctrl*/ (AUDIO_CTRL_RW << AUDIO_CLOCK_SOURCE_CTRL_CLK_FRQ_POS),
+                           /*_assocTerm*/ UAC2_ENTITY_INPUT_TERM, /*_stridx*/ 0x00),
 
     // --- Input Terminal: the USB stream entering the device -----------------
     TUD_AUDIO_DESC_INPUT_TERM(/*_termid*/ UAC2_ENTITY_INPUT_TERM,
@@ -148,10 +155,12 @@ static uint8_t const desc_configuration[] = {
                                  /*_maxEPsize*/ CFG_TUD_AUDIO_EP_SZ_OUT,
                                  /*_interval*/ 0x01),
 
+    // lock-delay declared in milliseconds (1 ms) like the proven example; an
+    // UNDEFINED/0 lock delay is rejected by some hosts for an async data EP.
     TUD_AUDIO_DESC_CS_AS_ISO_EP(/*_attr*/ AUDIO_CS_AS_ISO_DATA_EP_ATT_NON_MAX_PACKETS_OK,
                                 /*_ctrl*/ AUDIO_CTRL_NONE,
-                                /*_lockdelayunit*/ AUDIO_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_UNDEFINED,
-                                /*_lockdelay*/ 0x0000),
+                                /*_lockdelayunit*/ AUDIO_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_MILLISEC,
+                                /*_lockdelay*/ 0x0001),
 
     // --- Isochronous feedback IN endpoint -----------------------------------
     // Full-speed async feedback carries a 3-byte (10.14) value; declare a 4-byte
