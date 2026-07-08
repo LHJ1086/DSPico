@@ -32,10 +32,12 @@ static tusb_desc_device_t const desc_device = {
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = USB_VID,
     .idProduct          = USB_PID,
-    // Windows caches the MS OS 2.0 / WinUSB binding per VID/PID/bcdDevice.
-    // Bump this whenever the descriptor layout or the vendor-interface driver
-    // story changes, or old (possibly failed) bindings stick forever.
-    .bcdDevice          = 0x0102,
+    // Windows caches the MS OS 2.0 / WinUSB binding AND the audio device's
+    // format/endpoint properties per VID/PID/bcdDevice. Bump this whenever the
+    // descriptor layout changes, or a stale (possibly failed) cached state
+    // sticks forever. Bumped to 0x0103 with the switch to a 16-bit PC-facing
+    // format so the OS re-reads the device fresh.
+    .bcdDevice          = 0x0103,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x03,
@@ -145,9 +147,10 @@ static uint8_t const desc_configuration[] = {
                              /*_channelcfg*/ (AUDIO_CHANNEL_CONFIG_FRONT_LEFT | AUDIO_CHANNEL_CONFIG_FRONT_RIGHT),
                              /*_stridx*/ 0x00),
 
-    // --- Type I format: 24-bit in a 3-byte sub-slot -------------------------
-    TUD_AUDIO_DESC_TYPE_I_FORMAT(/*_subslotsize*/ DSPICO_BYTES_PER_SAMPLE,
-                                 /*_bitresolution*/ DSPICO_RESOLUTION_BITS),
+    // --- Type I format: 16-bit in a 2-byte sub-slot (PC-facing) -------------
+    // 16-bit is the universally host-renderable format; see board_config.h.
+    TUD_AUDIO_DESC_TYPE_I_FORMAT(/*_subslotsize*/ DSPICO_DEV_BYTES_PER_SAMPLE,
+                                 /*_bitresolution*/ DSPICO_DEV_RESOLUTION_BITS),
 
     // --- Isochronous OUT data endpoint (async; rate set by feedback) --------
     TUD_AUDIO_DESC_STD_AS_ISO_EP(/*_ep*/ EPNUM_AUDIO_OUT,

@@ -85,13 +85,15 @@ extern "C" {
 #define CFG_TUD_AUDIO_ENABLE_EP_OUT       1
 #define CFG_TUD_AUDIO_ENABLE_EP_IN        0
 
+// PC-facing RX format is 16-bit (see board_config.h); RX expands to the
+// internal 24-bit path.
 #define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX          DSPICO_NUM_CHANNELS
-#define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX  DSPICO_BYTES_PER_SAMPLE
+#define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX  DSPICO_DEV_BYTES_PER_SAMPLE
 
 // Max OUT endpoint payload. For an asynchronous sink the host may send one
 // extra sample per frame, so budget (samples/ms + 1).
 #define CFG_TUD_AUDIO_EP_SZ_OUT \
-  ((DSPICO_SAMPLES_PER_MS + 1) * DSPICO_NUM_CHANNELS * DSPICO_BYTES_PER_SAMPLE)
+  ((DSPICO_SAMPLES_PER_MS + 1) * DSPICO_NUM_CHANNELS * DSPICO_DEV_BYTES_PER_SAMPLE)
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX     CFG_TUD_AUDIO_EP_SZ_OUT
 
 // Software FIFO behind the OUT endpoint (a couple of frames of slack).

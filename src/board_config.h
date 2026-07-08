@@ -54,11 +54,24 @@
 // WS2812B (NeoPixel) on GPIO16. Single pixel used as a coarse state indicator.
 #define DSPICO_WS2812_PIN 16
 
-// --- Audio format (LOCKED, brief §1) ---------------------------------------
+// --- Audio format ----------------------------------------------------------
+// Internal DSP path + DAC (host) side: 24-bit. The PEQ runs in float and the
+// play ring / DAC packets are 24-bit packed, so we keep full headroom through
+// the EQ and can feed a 24-bit DAC alt when one is chosen.
 #define DSPICO_SAMPLE_RATE_HZ   48000u
 #define DSPICO_NUM_CHANNELS     2u
-#define DSPICO_BYTES_PER_SAMPLE 3u        // 24-bit packed on the wire
+#define DSPICO_BYTES_PER_SAMPLE 3u        // 24-bit packed (internal + DAC side)
 #define DSPICO_RESOLUTION_BITS  24u
+
+// PC-facing (device) wire format: 16-bit. This is the format the proven
+// TinyUSB uac2_speaker_fb example uses and the one Windows' shared-mode audio
+// engine renders universally — a 24-bit-only device enumerates and shows a
+// volume slider but the OS silently never opens the stream. RX expands each
+// 16-bit sample to the internal 24-bit format (value << 8, i.e. [0, lo, hi]);
+// the DAC side already truncates back to 16-bit for DACs that need it, so no
+// resolution is lost end-to-end.
+#define DSPICO_DEV_BYTES_PER_SAMPLE 2u
+#define DSPICO_DEV_RESOLUTION_BITS  16u
 
 // One 1 ms USB frame's worth of audio (nominal). At 48 kHz that is 48
 // samples/frame/channel. We size ring buffers generously around this.
