@@ -19,7 +19,7 @@
 // they don't byte-interleave with and garble the device-side (core0) trace we
 // are trying to read. Set to 0 for a normal build.
 #ifndef DSPICO_USB_TRACE
-#define DSPICO_USB_TRACE 1
+#define DSPICO_USB_TRACE 0
 #endif
 
 // --- System clock ----------------------------------------------------------

@@ -26,6 +26,7 @@
 #include "status_led.h"
 #include "uac2_device.h"
 #include "uac_host.h"
+#include "usb_descriptors.h"
 #include "test_tone.h"
 #include "signal_path.h"
 #include "config_usb.h"
@@ -115,6 +116,12 @@ int main(void) {
                 POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_POWMAN_BITS)) ? " watchdog" : "",
         (rst & POWMAN_CHIP_RESET_HAD_DP_RESET_REQ_BITS) ? " debugger" : "",
         (unsigned long) rst, (unsigned long) DSPICO_SYS_CLK_KHZ);
+
+  // Diagnostic: dump our own configuration descriptor so the exact bytes the
+  // PC (and TinyUSB's audiod) parse are visible in the log at bring-up.
+#if DSPICO_USB_TRACE
+  dspico_dump_config_desc();
+#endif
 
   // On-device signal path (PEQ engine + play ring). Flat by default; the UAC2
   // volume callback and the WebUSB config handler configure it live.

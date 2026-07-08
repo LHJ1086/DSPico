@@ -5,9 +5,13 @@
 // lengths are computed by the library rather than hand-counted. See
 // usb_descriptors.h for the interface/entity/endpoint map.
 // ---------------------------------------------------------------------------
+#include <stdio.h>
+#include <string.h>
+
 #include "tusb.h"
 #include "pico/unique_id.h"
 #include "board_config.h"
+#include "debug_log.h"
 #include "usb_descriptors.h"
 
 // A development VID/PID pair from the pid.codes test range. Replace with your
@@ -51,11 +55,20 @@ uint8_t const *tud_descriptor_device_cb(void) {
 // ---------------------------------------------------------------------------
 // Configuration descriptor
 // ---------------------------------------------------------------------------
-// wTotalLength of the class-specific AudioControl interface block (its own
-// header + clock source + input terminal + feature unit + output terminal).
+// wTotalLength of the class-specific AudioControl interface block. This counts
+// ONLY the entity descriptors that FOLLOW the CS-AC header (clock source, input
+// terminal, feature unit, output terminal). The TUD_AUDIO_DESC_CS_AC macro adds
+// the 9-byte header itself (see its comment: "Do not include
+// TUD_AUDIO_DESC_CS_AC_LEN, we already do this here").
+//
+// Including the header here was a real bug: it made wTotalLength 9 bytes too
+// large (73 vs 64), so TinyUSB's audiod skipped past the AS alt-0 interface
+// when parsing, failed to find the streaming interface, and silently never
+// opened the OUT stream — the PC enumerated the device and drove its volume but
+// no audio ever flowed. Matches the proven uac2_speaker_fb example, which also
+// omits the header from this sum.
 #define UAC2_CS_AC_TOTAL_LEN                       \
-  (TUD_AUDIO_DESC_CS_AC_LEN                         \
-   + TUD_AUDIO_DESC_CLK_SRC_LEN                     \
+  (TUD_AUDIO_DESC_CLK_SRC_LEN                       \
    + TUD_AUDIO_DESC_INPUT_TERM_LEN                  \
    + TUD_AUDIO_DESC_FEATURE_UNIT_TWO_CHANNEL_LEN    \
    + TUD_AUDIO_DESC_OUTPUT_TERM_LEN)
@@ -182,6 +195,22 @@ TU_VERIFY_STATIC(sizeof(desc_configuration) == CONFIG_TOTAL_LEN,
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
   (void) index;
   return desc_configuration;
+}
+
+// Boot-time hex dump of our own configuration descriptor, so the exact bytes
+// audiod parses (AC interface, CS-AC wTotalLength, the AS alt interfaces) are
+// verifiable in the log. Emitted once at startup, before the PC enumerates, so
+// it can't be garbled by later traffic.
+void dspico_dump_config_desc(void) {
+  dlog0("DSPico device: config descriptor (%u bytes):\n",
+        (unsigned) sizeof(desc_configuration));
+  for (unsigned i = 0; i < sizeof(desc_configuration); i += 16) {
+    char line[80];
+    int n = snprintf(line, sizeof line, "  %03u:", i);
+    for (unsigned j = 0; j < 16 && i + j < sizeof(desc_configuration); j++)
+      n += snprintf(line + n, sizeof line - n, " %02X", desc_configuration[i + j]);
+    dlog0("%s\n", line);
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -33,6 +33,9 @@ enum {
 const uint8_t *dspico_desc_ms_os_20(uint16_t *len);
 const uint8_t *dspico_desc_webusb_url(uint16_t *len);
 
+// Boot-time diagnostic: hex-dump the configuration descriptor to the log.
+void dspico_dump_config_desc(void);
+
 // --- Audio entity IDs (unique within the AC interface) ----------------------
 #define UAC2_ENTITY_CLOCK        0x04
 #define UAC2_ENTITY_INPUT_TERM   0x01
