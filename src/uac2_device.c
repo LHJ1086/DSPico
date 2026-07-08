@@ -9,8 +9,10 @@
 #include <math.h>
 #include <string.h>
 
+#include "pico/time.h"
 #include "tusb.h"
 #include "board_config.h"
+#include "audio_ring.h"      // AUDIO_RING_CAP (feedback controller target)
 #include "debug_log.h"
 #include "usb_descriptors.h"
 #include "uac2_device.h"
@@ -121,15 +123,60 @@ bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received,
 }
 
 // ---------------------------------------------------------------------------
-// Async feedback: let TinyUSB derive the value from our FIFO fill level so the
-// PC's send rate tracks our drain rate (brief §5). Simple and correct for a
-// single fixed sample rate; Phase 4 replaces the source with the DAC FIFO.
+// Async feedback: computed HERE from the play ring's fill level, not by
+// TinyUSB. TinyUSB's FIFO_COUNT method regulates its own EP FIFO — which the
+// RX callback above drains to empty on every packet, so that method saw a
+// permanently "starving" FIFO and told the PC to oversend forever. The play
+// ring then pegged full and process_and_push() dropped whole bursts
+// (drop-newest), which is audible as crackle/chopping on every DAC.
+//
+// The buffer that actually matters is the play ring between the PC and the
+// DAC, so a small proportional controller regulates exactly that: fill above
+// target -> ask the PC for fewer samples per frame, below target -> more.
 // ---------------------------------------------------------------------------
 void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf,
                                   audio_feedback_params_t *feedback_param) {
   (void) func_id; (void) alt_itf;
-  feedback_param->method = AUDIO_FEEDBACK_METHOD_FIFO_COUNT;
+  feedback_param->method = AUDIO_FEEDBACK_METHOD_DISABLED;   // we call tud_audio_fb_set()
   feedback_param->sample_freq = DSPICO_SAMPLE_RATE_HZ;
+}
+
+// Nominal feedback value: samples per 1 ms frame in 16.16 fixed point.
+// (TinyUSB converts to the 10.14 full-speed wire format when sending.)
+#define FB_NOMINAL_16_16   ((uint32_t) DSPICO_SAMPLES_PER_MS << 16)
+// Regulate the ring to half-full and never ask for more than ±0.5 samples per
+// frame of correction (±32768 in 16.16) — gentle, unconditionally stable, and
+// still recovers a fully skewed ring in about 1.5 s.
+#define FB_TARGET_BYTES    (AUDIO_RING_CAP / 2)
+#define FB_MAX_DELTA_16_16 32768
+
+void uac2_feedback_task(void) {
+  static uint32_t last_ms;
+  static uint32_t fill_avg;   // EMA of the ring fill, in bytes
+
+  if (!uac2_is_streaming()) { last_ms = 0; return; }
+
+  const uint32_t now = to_ms_since_boot(get_absolute_time());
+  if (last_ms == 0) {                      // stream just opened: seed state
+    last_ms = now;
+    fill_avg = FB_TARGET_BYTES;
+    tud_audio_fb_set(FB_NOMINAL_16_16);    // arm the feedback EP's send loop
+    return;
+  }
+  if (now - last_ms < 4) return;           // ~4 ms update cadence is plenty
+  last_ms = now;
+
+  // Smooth the fill reading (it saw-tooths by a packet per ms).
+  const uint32_t fill = signal_path_play_fill();
+  fill_avg += (uint32_t) (((int32_t) fill - (int32_t) fill_avg) >> 3);
+
+  // One byte of error = 1/6 frame; scale so the clamp engages beyond ~2 KB of
+  // error (gain ≈ 0.0015 frames/frame per byte — time constant ~0.7 s).
+  int32_t delta = ((int32_t) FB_TARGET_BYTES - (int32_t) fill_avg) * 16;
+  if (delta >  FB_MAX_DELTA_16_16) delta =  FB_MAX_DELTA_16_16;
+  if (delta < -FB_MAX_DELTA_16_16) delta = -FB_MAX_DELTA_16_16;
+
+  tud_audio_fb_set(FB_NOMINAL_16_16 + (uint32_t) delta);
 }
 
 // ---------------------------------------------------------------------------
