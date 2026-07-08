@@ -5,6 +5,7 @@
 // the big caveat: isochronous OUT over the bit-banged PIO port is unproven, so
 // treat this as the scaffold you iterate on with a logic analyzer.
 // ---------------------------------------------------------------------------
+#include <stdio.h>
 #include <string.h>
 
 #include "pico/time.h"
@@ -12,10 +13,19 @@
 #include "debug_log.h"
 #include "host/usbh_pvt.h"   // usbh_class_driver_t, usbh_driver_set_config_complete
 #include "board_config.h"
+#include "signal_path.h"     // signal_path_play_fill() (heartbeat diagnostics)
 #include "uac_host.h"
 
-// Max audio payload we will ever put on the wire in one frame.
-#define UAC_HOST_PKT_MAX  ((DSPICO_SAMPLES_PER_MS + 1) * DSPICO_NUM_CHANNELS * DSPICO_BYTES_PER_SAMPLE)
+// Max audio payload we will ever put on the wire in one frame. The widest
+// wire format is a 4-byte subslot (24-in-32), not the native 3-byte one.
+#define UAC_HOST_PKT_MAX  ((DSPICO_SAMPLES_PER_MS + 1) * DSPICO_NUM_CHANNELS * 4u)
+
+// Linux pacing quirk (QUIRK_FLAG_CTL_MSG_DELAY_5M): several USB-C dongle DACs
+// (Samsung/AKG, Huawei, Vivo — all in sound/usb/quirks.c) misbehave when
+// class-control requests arrive back-to-back; real hosts space them out. We
+// pace EVERY setup-chain step by this much — costs ~50 ms once per attach,
+// harmless for compliant DACs.
+#define UAC_HOST_CTL_PACE_MS 5u
 
 // ---------------------------------------------------------------------------
 // Device state (single DAC supported for the spike)
@@ -27,7 +37,14 @@ typedef struct {
 
   uint8_t  ac_itf;          // Audio Control interface number
   uint16_t audio_bcd;       // 0x0100 = UAC1, 0x0200 = UAC2
-  uint8_t  clock_id;        // UAC2 Clock Source entity (0 if none)
+
+  // UAC2 clock topology. Headset codecs (e.g. the CX31988 family) expose more
+  // than one Clock Source (DAC + ADC paths) and sometimes a Clock Selector; a
+  // real host walks the chain, so we record every source and the selector and
+  // program them all rather than betting on "the last one parsed".
+  uint8_t  clock_ids[4];    // every UAC2 Clock Source entity seen
+  uint8_t  clock_count;
+  uint8_t  clock_sel_id;    // UAC2 Clock Selector entity (0 if none)
 
   // Feature Unit discovery, to unmute/set volume on the DAC's playback path
   // (real hosts always do this; DACs may power up muted or at minimum volume).
@@ -40,11 +57,18 @@ typedef struct {
   uint8_t  as_alt;          // operational alt setting (has the iso EP)
   bool     have_as;
 
-  uint8_t  subslot;         // wire bytes/sample: 3 = native 24-bit, 2 = 16-bit fallback
+  uint8_t  subslot;         // wire bytes/sample: 2, 3, or 4 (24-in-32)
   uint8_t  bits;            // valid bits/sample of the chosen alt (for diagnostics)
+  uint8_t  cand_rank;       // ranking of the accepted candidate (lower = better)
 
   tusb_desc_endpoint_t ep_out;   // the isochronous OUT endpoint descriptor
   bool     have_ep;
+
+  // Async-DAC clock tracking: the explicit feedback (iso IN) endpoint of the
+  // chosen alt, if the data endpoint declares asynchronous sync.
+  tusb_desc_endpoint_t ep_fb;
+  bool     have_fb;
+  bool     ep_async;        // data EP bmAttributes.sync == asynchronous
 
   bool     incompatible;    // audio device seen, but nothing we can stream to
   bool     streaming;
@@ -52,6 +76,15 @@ typedef struct {
 
 static dac_dev_t s_dac;
 static uac_host_fill_cb_t s_fill_cb = NULL;
+
+// Raw audio-function descriptor block, captured on attach and hex-dumped
+// incrementally from uac_host_task() (one line per pass, so the diagnostic log
+// ring never overflows). This is what finally reveals exactly what a stubborn
+// DAC — e.g. the CX31988 — advertises, without needing a USB analyzer.
+#define UAC_DESC_DUMP_MAX 512u
+static uint8_t  s_desc_dump[UAC_DESC_DUMP_MAX];
+static uint16_t s_desc_len;   // bytes captured
+static uint16_t s_desc_pos;   // dump cursor (== s_desc_len when finished)
 
 // One outstanding iso packet at a time; DMA-aligned.
 CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN static uint8_t s_pkt[UAC_HOST_PKT_MAX];
@@ -81,41 +114,86 @@ typedef struct {
   bool    pcm;         // format is Type I PCM
   bool    rate_ok;     // 48 kHz supported (assumed true unless a UAC1 list says no)
   bool    in_as_itf;   // currently inside an AS interface's descriptors
+  // The alt's iso OUT data EP and (optional) iso IN feedback EP. Both are
+  // collected while walking the alt; the candidate is judged when the alt
+  // ends, because in descriptor order the feedback EP follows the data EP.
+  tusb_desc_endpoint_t data_ep;
+  bool    have_data;
+  tusb_desc_endpoint_t fb_ep;
+  bool    have_fb;
 } alt_cand_t;
 
-// Which wire sample width to prefer when a DAC offers both. Field results:
-// 16-bit (2-byte subslot) is PROVEN AUDIBLE over the patched PIO host, while
-// the larger 24-bit packets are still under investigation — so bring-up
-// prefers 16-bit. Set to 3 to prefer native 24-bit once that path is proven.
-#ifndef UAC_HOST_PREFER_SUBSLOT
-#define UAC_HOST_PREFER_SUBSLOT 2
+// Rank of a wire sample width — lower is better. 16-bit (subslot 2) is the
+// PROVEN-AUDIBLE format over the patched PIO host; native 24-bit (3) and
+// 24-in-32 (4) stream but were still under investigation in the field, so we
+// keep 16-bit as the default choice while accepting the wider formats when a
+// DAC offers nothing else (a headset codec that only advertises 32-bit would
+// otherwise read as "incompatible").
+static uint8_t subslot_rank(uint8_t subslot) {
+  switch (subslot) {
+    case 2:  return 0;   // 16-bit: proven
+    case 3:  return 1;   // 24-bit packed
+    case 4:  return 2;   // 24-in-32
+    default: return 0xFF;
+  }
+}
+
+// The largest packet the patched PIO encoder can stage. PIO_USB_EP_SIZE is 580
+// in the carried patch; a DAC alt whose wMaxPacketSize exceeds it would smash
+// the encode buffer, so such an alt is rejected here rather than crashing
+// core1 mid-stream. (We never fill more than one 1 ms frame anyway.)
+#ifndef UAC_HOST_MAX_WIRE_PKT
+#define UAC_HOST_MAX_WIRE_PKT 580u
 #endif
 
 // Accept an alt setting if it can take our stream: stereo Type-I PCM at 48 kHz
-// in a 2-byte (16-bit) or 3-byte (24-bit) subslot; see the preference above.
+// in a 2/3/4-byte subslot. Among acceptable alts, keep the best-ranked one.
 static void consider_candidate(dac_dev_t *d, const alt_cand_t *c,
                                tusb_desc_endpoint_t const *ep) {
+  const uint8_t rank = subslot_rank(c->subslot);
+  // Frames this alt can carry in one 1 ms packet (whole frames only).
+  const uint16_t wire_bpf = (uint16_t) (DSPICO_NUM_CHANNELS * c->subslot);
+  const uint16_t max_frames = wire_bpf ? (ep->wMaxPacketSize / wire_bpf) : 0;
+
   // Log every candidate so an "incompatible" verdict is diagnosable from the
-  // UART without a USB analyzer.
-  dlog("DSPico host: alt itf %u.%u: ch=%u subslot=%u bits=%u pcm=%d rate48=%d maxpkt=%u\n",
+  // UART/WebUSB log without a USB analyzer.
+  dlog("DSPico host: alt itf %u.%u ch=%u subslot=%u bits=%u pcm=%d rate48=%d "
+       "maxpkt=%u(%uframes) sync=%s fb=%d\n",
          c->itf, c->alt, c->channels, c->subslot, c->bits,
-         (int) c->pcm, (int) c->rate_ok, ep->wMaxPacketSize);
+         (int) c->pcm, (int) c->rate_ok, ep->wMaxPacketSize, max_frames,
+         ep->bmAttributes.sync == 1 ? "async" :
+         ep->bmAttributes.sync == 2 ? "adaptive" :
+         ep->bmAttributes.sync == 3 ? "sync" : "none",
+         (int) c->have_fb);
+
   if (!c->pcm || !c->rate_ok) return;
   if (c->channels != DSPICO_NUM_CHANNELS) return;
-  if (c->subslot != 3 && c->subslot != 2) return;
-  if (ep->wMaxPacketSize < DSPICO_NUM_CHANNELS * c->subslot) return;
-  if (d->have_ep) {
-    const bool cur_pref = (d->subslot == UAC_HOST_PREFER_SUBSLOT);
-    const bool new_pref = (c->subslot == UAC_HOST_PREFER_SUBSLOT);
-    if (cur_pref || !new_pref) return;   // keep unless upgrading to preferred
+  if (rank == 0xFF) return;                       // unsupported subslot width
+  if (ep->wMaxPacketSize > UAC_HOST_MAX_WIRE_PKT) {
+    dlog("DSPico host:   ^ rejected: maxpkt %u exceeds PIO encode limit %u\n",
+           ep->wMaxPacketSize, UAC_HOST_MAX_WIRE_PKT);
+    return;
+  }
+  // Must carry a whole 1 ms frame (48 stereo frames). A short-packet alt would
+  // starve the DAC — better to keep looking (and warn if it's all we find).
+  if (max_frames < DSPICO_SAMPLES_PER_MS) {
+    dlog("DSPico host:   ^ note: only %u frames/pkt (< %u) — undersized\n",
+           max_frames, (unsigned) DSPICO_SAMPLES_PER_MS);
+    return;
   }
 
-  d->as_itf  = c->itf;
-  d->as_alt  = c->alt;
-  d->subslot = c->subslot;
-  d->bits    = c->bits;
+  if (d->have_ep && subslot_rank(d->subslot) <= rank) return;  // keep better/equal
+
+  d->as_itf   = c->itf;
+  d->as_alt   = c->alt;
+  d->subslot  = c->subslot;
+  d->bits     = c->bits;
+  d->cand_rank = rank;
+  d->ep_async = (ep->bmAttributes.sync == 1);   // 1 = asynchronous
   memcpy(&d->ep_out, ep, sizeof(*ep));
   d->have_ep = d->have_as = true;
+  d->have_fb = c->have_fb;
+  if (c->have_fb) memcpy(&d->ep_fb, &c->fb_ep, sizeof(d->ep_fb));
 }
 
 // UAC1 Type I format descriptor carries the supported sample rates; check that
@@ -137,14 +215,26 @@ static bool uac1_rate_list_has_48k(uint8_t const *p, uint8_t dlen) {
   return false;
 }
 
+// Judge the current AS-alt candidate (data + optional feedback EP) and reset it
+// so the next alt starts clean. Called at every AS-interface boundary and at
+// the end of the block, so the feedback EP that follows the data EP is included.
+static void flush_candidate(dac_dev_t *d, alt_cand_t *cand) {
+  if (cand->in_as_itf && cand->have_data) {
+    consider_candidate(d, cand, &cand->data_ep);
+  }
+  cand->in_as_itf = false;
+  cand->have_data = false;
+  cand->have_fb   = false;
+}
+
 // Single-pass parse of the whole audio-function descriptor block. With an IAD
 // (typical UAC2) TinyUSB hands us the entire function at once; without one
 // (typical UAC1) it hands us one interface at a time — walking `len` bytes and
 // tracking the current interface context handles both.
 //
-// Records: the AC interface number, UAC version, a UAC2 clock-source id, and —
-// via consider_candidate() — the best alt setting whose Type-I PCM format we
-// can actually feed (stereo 48 kHz, 24-bit preferred, 16-bit fallback).
+// Records: the AC interface number, UAC version, every UAC2 clock source, a
+// clock selector, the playback feature units, and — via consider_candidate() —
+// the best alt setting whose Type-I PCM format we can feed (stereo 48 kHz).
 static void parse_audio_function(dac_dev_t *d, uint8_t const *p, uint16_t len) {
   uint8_t const *end = p + len;
   uint8_t cur_sub = 0xFF;                 // current interface subclass
@@ -155,8 +245,8 @@ static void parse_audio_function(dac_dev_t *d, uint8_t const *p, uint16_t len) {
     const uint8_t dlen  = p[0];
 
     if (dtype == TUSB_DESC_INTERFACE) {
+      flush_candidate(d, &cand);          // judge the alt we were inside
       tusb_desc_interface_t const *itf = (tusb_desc_interface_t const *) p;
-      cand.in_as_itf = false;
       if (itf->bInterfaceClass == TUSB_CLASS_AUDIO) {
         cur_sub = itf->bInterfaceSubClass;
         if (cur_sub == AUDIO_SUBCLASS_CONTROL) {
@@ -174,8 +264,11 @@ static void parse_audio_function(dac_dev_t *d, uint8_t const *p, uint16_t len) {
       const uint8_t subtype = p[2];
       if (subtype == AUDIO_CS_AC_INTERFACE_HEADER) {
         d->audio_bcd = tu_unaligned_read16(p + 3);   // bcdADC
-      } else if (subtype == AUDIO_CS_AC_INTERFACE_CLOCK_SOURCE) {
-        d->clock_id = p[3];                            // bClockID
+      } else if (subtype == AUDIO_CS_AC_INTERFACE_CLOCK_SOURCE && dlen >= 4) {
+        if (d->clock_count < TU_ARRAY_SIZE(d->clock_ids))
+          d->clock_ids[d->clock_count++] = p[3];      // bClockID
+      } else if (subtype == AUDIO_CS_AC_INTERFACE_CLOCK_SELECTOR && dlen >= 4) {
+        d->clock_sel_id = p[3];                        // bClockID of the selector
       } else if (subtype == AUDIO_CS_AC_INTERFACE_FEATURE_UNIT && dlen >= 5) {
         if (d->fu_count < sizeof(d->fu_ids)) d->fu_ids[d->fu_count++] = p[3];
       } else if (subtype == AUDIO_CS_AC_INTERFACE_OUTPUT_TERMINAL && dlen >= 8) {
@@ -209,13 +302,19 @@ static void parse_audio_function(dac_dev_t *d, uint8_t const *p, uint16_t len) {
       tusb_desc_endpoint_t const *ep = (tusb_desc_endpoint_t const *) p;
       const bool is_iso  = (ep->bmAttributes.xfer == TUSB_XFER_ISOCHRONOUS);
       const bool is_out  = (tu_edpt_dir(ep->bEndpointAddress) == TUSB_DIR_OUT);
-      const bool is_data = (ep->bmAttributes.usage == 0x00);   // not feedback
+      const bool is_data = (ep->bmAttributes.usage == 0x00);   // 0x00 = data
+      const bool is_fb   = (ep->bmAttributes.usage == 0x01);   // 0x01 = feedback
       if (is_iso && is_out && is_data) {
-        consider_candidate(d, &cand, ep);
+        memcpy(&cand.data_ep, ep, sizeof(cand.data_ep));
+        cand.have_data = true;
+      } else if (is_iso && !is_out && is_fb) {
+        memcpy(&cand.fb_ep, ep, sizeof(cand.fb_ep));
+        cand.have_fb = true;
       }
     }
     p = desc_next(p);
   }
+  flush_candidate(d, &cand);              // judge the final alt at block end
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +322,7 @@ static void parse_audio_function(dac_dev_t *d, uint8_t const *p, uint16_t len) {
 // ---------------------------------------------------------------------------
 static bool dac_init(void) {
   memset(&s_dac, 0, sizeof(s_dac));
+  s_desc_len = s_desc_pos = 0;
   return true;
 }
 
@@ -241,6 +341,16 @@ static bool dac_open(uint8_t rhport, uint8_t dev_addr,
   s_dac.in_use = true;
   s_dac.dev_addr = dev_addr;
   s_dac.rhport = rhport;
+
+  // Capture the descriptor block for the incremental hex dump (first call only —
+  // UAC1 without an IAD calls open() once per interface).
+  if (s_desc_len == 0) {
+    uint16_t n = max_len < UAC_DESC_DUMP_MAX ? max_len : UAC_DESC_DUMP_MAX;
+    memcpy(s_desc_dump, itf_desc, n);
+    s_desc_len = n;
+    s_desc_pos = 0;
+    dlog("DSPico host: dumping %u-byte audio descriptor block:\n", n);
+  }
 
   parse_audio_function(&s_dac, (uint8_t const *) itf_desc, max_len);
   return true;   // claim the audio interface(s) in this block
@@ -277,9 +387,18 @@ static uint32_t s_step_deadline_ms;        // 0 = no step pending
 static uint32_t s_chain_gen;
 
 // After an abort, let the bus/stack settle a couple of frames before the next
-// step instead of submitting from inside the same task pass.
+// step instead of submitting from inside the same task pass. The same
+// mechanism paces EVERY chain step by UAC_HOST_CTL_PACE_MS (the Linux
+// CTL_MSG_DELAY quirk that quirky USB-C dongle DACs need — see the top of the
+// file): completion handlers hand the next step to schedule_step() instead of
+// calling it inline.
 static void (*s_deferred_next)(void);
 static uint32_t s_deferred_at_ms;
+
+static void schedule_step(void (*fn)(void)) {
+  s_deferred_next = fn;
+  s_deferred_at_ms = to_ms_since_boot(get_absolute_time()) + UAC_HOST_CTL_PACE_MS;
+}
 
 static void arm_step_watchdog(void (*on_timeout)(void)) {
   s_timeout_next = on_timeout;
@@ -297,6 +416,20 @@ static bool stale_completion(tuh_xfer_t *xfer) {
 
 void uac_host_task(void) {
   const uint32_t now = to_ms_since_boot(get_absolute_time());
+
+  // Drip the captured descriptor block into the diagnostic log, one 16-byte
+  // line per pass so the log ring never overflows.
+  if (s_desc_pos < s_desc_len) {
+    char line[64];
+    int  n = 0;
+    n += snprintf(line + n, sizeof line - n, "  %03u:", (unsigned) s_desc_pos);
+    for (uint16_t i = 0; i < 16 && s_desc_pos + i < s_desc_len; i++) {
+      n += snprintf(line + n, sizeof line - n, " %02X", s_desc_dump[s_desc_pos + i]);
+    }
+    dlog("%s\n", line);
+    s_desc_pos += 16;
+    return;   // one line per pass
+  }
 
   if (s_deferred_next && (int32_t) (now - s_deferred_at_ms) >= 0) {
     void (*fn)(void) = s_deferred_next;
@@ -329,28 +462,36 @@ static void timeout_alt(void) {
   usbh_driver_set_config_complete(s_dac.dev_addr, s_dac.as_itf);
 }
 static void send_set_sample_rate_uac1(void);
-static void send_set_sample_rate_uac2(void);
+static void send_set_rate_current_clock(void);   // UAC2: one clock source
+static void send_get_rate_readback(void);         // UAC2: verify + log
 static uint8_t s_rate_tries;
+static uint8_t s_clock_idx;   // which UAC2 clock source we're programming
 
 static void timeout_rate(void) {
   // A NAK-forever rate request may still succeed on a retry once the DAC has
   // settled (the audible symptom of an unset rate is wrong-pitch playback) —
-  // try a couple more times before continuing without it.
+  // try a couple more times before moving on to the next clock / step.
   if (++s_rate_tries < 3) {
     dlog("DSPico host: retrying sample-rate set (%u/3)\n", (unsigned) (s_rate_tries + 1));
-    if (setup_is_uac2()) send_set_sample_rate_uac2();
+    if (setup_is_uac2()) send_set_rate_current_clock();
     else                 send_set_sample_rate_uac1();
     return;
   }
-  if (setup_is_uac2()) send_set_interface();
-  else                 start_fu_init();
+  if (setup_is_uac2()) {
+    // Give up on this clock source; try the next, else read back + continue.
+    s_rate_tries = 0;
+    if (++s_clock_idx < s_dac.clock_count) schedule_step(send_set_rate_current_clock);
+    else                                   schedule_step(send_get_rate_readback);
+  } else {
+    start_fu_init();
+  }
 }
 static void timeout_fu(void) {
   fu_send_next();   // s_fu_step already advanced — moves to the next control
 }
 
 static bool setup_is_uac2(void) {
-  return s_dac.audio_bcd >= 0x0200 && s_dac.clock_id != 0;
+  return s_dac.audio_bcd >= 0x0200 && s_dac.clock_count > 0;
 }
 
 // --- DAC Feature-Unit init (unmute + 0 dB volume) ----------------------------
@@ -389,7 +530,7 @@ static void on_fu_step_complete(tuh_xfer_t *xfer) {
          s_fu_steps[i].sel == AUDIO_FU_CTRL_MUTE ? "unmute" : "vol -12dB",
          s_fu_steps[i].ch,
          xfer->result == XFER_RESULT_SUCCESS ? "OK" : "stalled (not implemented)");
-  fu_send_next();
+  schedule_step(fu_send_next);   // pace control requests (dongle quirk)
 }
 
 static void fu_send_next(void) {
@@ -488,13 +629,21 @@ static void send_set_interface(void) {
   }
 }
 
-// UAC2: SET_CUR sample frequency on the Clock Source entity.
+// UAC2: SET_CUR sample frequency (SAM_FREQ) on ONE Clock Source entity. Headset
+// codecs expose several clock sources (playback + capture paths) and sometimes a
+// Clock Selector; we program every source in turn (send_set_rate_current_clock
+// walks s_clock_idx) rather than betting on one. A source that rejects the rate
+// STALLs — fine, we move to the next.
 static uint8_t s_freq_buf[4];
-static void send_set_sample_rate_uac2(void) {
+static void send_set_rate_current_clock(void) {
   s_freq_buf[0] = (uint8_t)(DSPICO_SAMPLE_RATE_HZ & 0xFF);
   s_freq_buf[1] = (uint8_t)((DSPICO_SAMPLE_RATE_HZ >> 8) & 0xFF);
   s_freq_buf[2] = (uint8_t)((DSPICO_SAMPLE_RATE_HZ >> 16) & 0xFF);
   s_freq_buf[3] = (uint8_t)((DSPICO_SAMPLE_RATE_HZ >> 24) & 0xFF);
+
+  const uint8_t clk = s_dac.clock_ids[s_clock_idx];
+  dlog("DSPico host: SET rate 48000 on clock source %u (%u/%u)\n",
+         clk, (unsigned) (s_clock_idx + 1), (unsigned) s_dac.clock_count);
 
   tusb_control_request_t const req = {
       .bmRequestType_bit = { .recipient = TUSB_REQ_RCPT_INTERFACE,
@@ -502,7 +651,7 @@ static void send_set_sample_rate_uac2(void) {
                              .direction = TUSB_DIR_OUT },
       .bRequest = AUDIO_CS_REQ_CUR,
       .wValue = tu_htole16((uint16_t)(AUDIO_CS_CTRL_SAM_FREQ << 8)),
-      .wIndex = tu_htole16((uint16_t)((s_dac.clock_id << 8) | s_dac.ac_itf)),
+      .wIndex = tu_htole16((uint16_t)((clk << 8) | s_dac.ac_itf)),
       .wLength = tu_htole16(4),
   };
   tuh_xfer_t xfer = {
@@ -519,6 +668,52 @@ static void send_set_sample_rate_uac2(void) {
     dlog("DSPico host: set-rate submit failed\n");
     timeout_rate();
   }
+}
+
+// UAC2: GET_CUR the sample frequency back from the first clock source so the log
+// shows the rate the DAC actually settled on — the decisive datapoint for the
+// "plays at the wrong pitch" symptom (a NAK-forever SET leaves the DAC at its
+// power-on default, which the readback exposes without a USB analyzer).
+static void on_get_rate_complete(tuh_xfer_t *xfer);
+static void send_get_rate_readback(void) {
+  const uint8_t clk = s_dac.clock_ids[0];
+  tusb_control_request_t const req = {
+      .bmRequestType_bit = { .recipient = TUSB_REQ_RCPT_INTERFACE,
+                             .type = TUSB_REQ_TYPE_CLASS,
+                             .direction = TUSB_DIR_IN },
+      .bRequest = AUDIO_CS_REQ_CUR,
+      .wValue = tu_htole16((uint16_t)(AUDIO_CS_CTRL_SAM_FREQ << 8)),
+      .wIndex = tu_htole16((uint16_t)((clk << 8) | s_dac.ac_itf)),
+      .wLength = tu_htole16(4),
+  };
+  tuh_xfer_t xfer = {
+      .daddr = s_dac.dev_addr,
+      .ep_addr = 0,
+      .setup = &req,
+      .buffer = s_freq_buf,
+      .complete_cb = on_get_rate_complete,
+      .user_data = ++s_chain_gen,
+  };
+  if (tuh_control_xfer(&xfer)) {
+    arm_step_watchdog(send_set_interface);   // on timeout, just proceed to alt
+  } else {
+    send_set_interface();
+  }
+}
+
+static void on_get_rate_complete(tuh_xfer_t *xfer) {
+  if (stale_completion(xfer)) return;
+  disarm_step_watchdog();
+  if (xfer->result == XFER_RESULT_SUCCESS) {
+    const uint32_t rate = (uint32_t) (s_freq_buf[0] | (s_freq_buf[1] << 8) |
+                                      (s_freq_buf[2] << 16) | ((uint32_t) s_freq_buf[3] << 24));
+    dlog("DSPico host: clock reads back %lu Hz (want %lu)%s\n",
+           (unsigned long) rate, (unsigned long) DSPICO_SAMPLE_RATE_HZ,
+           rate == DSPICO_SAMPLE_RATE_HZ ? "" : " — MISMATCH (wrong pitch expected)");
+  } else {
+    dlog("DSPico host: clock rate readback stalled (continuing)\n");
+  }
+  schedule_step(send_set_interface);
 }
 
 // UAC1: SET_CUR sampling frequency (SAMPLING_FREQ_CONTROL) on the iso endpoint.
@@ -565,11 +760,20 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
     return true;
   }
 
-  dlog("DSPico host: DAC (UAC%c) itf %u alt %u — %u-bit in %u-byte subslot, EP 0x%02X maxpkt %u%s\n",
+  dlog("DSPico host: DAC (UAC%c) itf %u alt %u — %u-bit in %u-byte subslot, EP 0x%02X "
+       "maxpkt %u sync=%s%s\n",
          setup_is_uac2() ? '2' : '1',
          s_dac.as_itf, s_dac.as_alt, s_dac.bits, s_dac.subslot,
          s_dac.ep_out.bEndpointAddress, s_dac.ep_out.wMaxPacketSize,
-         s_dac.subslot == 2 ? " (16-bit fallback, truncating)" : "");
+         s_dac.ep_async ? "async" : "adaptive/sync",
+         s_dac.subslot == 2 ? " (16-bit, truncating)" :
+         s_dac.subslot == 4 ? " (24-in-32, left-justified)" : "");
+  if (s_dac.clock_count > 1 || s_dac.clock_sel_id)
+    dlog("DSPico host: clock topology — %u sources, selector id %u\n",
+           s_dac.clock_count, s_dac.clock_sel_id);
+  if (s_dac.ep_async && s_dac.have_fb)
+    dlog("DSPico host: DAC async feedback EP 0x%02X present (host sends fixed 48/frame; "
+         "drift tolerated by DAC buffering)\n", s_dac.ep_fb.bEndpointAddress);
 
   // Resolve the playback Feature Unit for the volume-init step: prefer the
   // unit that feeds the speaker/headphone Output Terminal, else the first.
@@ -581,8 +785,9 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
 
   // Kick the setup chain (see the ordering note above).
   s_rate_tries = 0;
+  s_clock_idx  = 0;
   if (setup_is_uac2()) {
-    send_set_sample_rate_uac2();   // rate first, then alt
+    send_set_rate_current_clock(); // rate on every clock source, then alt
   } else {
     send_set_interface();          // alt first, then endpoint rate
   }
@@ -601,9 +806,9 @@ static void on_set_alt_complete(tuh_xfer_t *xfer) {
     return;
   }
   if (setup_is_uac2()) {
-    start_fu_init();               // UAC2: rate already set — unmute, then stream
+    schedule_step(start_fu_init);            // UAC2: rate set — unmute, then stream
   } else {
-    send_set_sample_rate_uac1();   // UAC1: rate lives on the (now active) EP
+    schedule_step(send_set_sample_rate_uac1);// UAC1: rate lives on the (now active) EP
   }
 }
 
@@ -615,15 +820,20 @@ static void on_set_freq_complete(tuh_xfer_t *xfer) {
   dlog("DSPico host: SET sample rate 48000 -> %s\n",
          xfer->result == XFER_RESULT_SUCCESS ? "OK" : "stalled/failed (continuing)");
   if (setup_is_uac2()) {
-    send_set_interface();          // UAC2: now activate the alt
+    s_rate_tries = 0;
+    if (++s_clock_idx < s_dac.clock_count) {
+      schedule_step(send_set_rate_current_clock);   // program the next clock source
+    } else {
+      schedule_step(send_get_rate_readback);        // all sources done — verify + log
+    }
   } else {
-    start_fu_init();               // UAC1: alt+rate done — unmute, then stream
+    schedule_step(start_fu_init);  // UAC1: alt+rate done — unmute, then stream
   }
 }
 
 // --- Isochronous streaming loop --------------------------------------------
 static uint16_t build_packet(void) {
-  const uint8_t  wire_bps = s_dac.subslot;                       // 3 or 2
+  const uint8_t  wire_bps = s_dac.subslot;                       // 2, 3 or 4
   const uint16_t wire_bpf = DSPICO_NUM_CHANNELS * wire_bps;      // bytes/frame on the wire
 
   size_t frames = DSPICO_SAMPLES_PER_MS;
@@ -639,13 +849,27 @@ static uint16_t build_packet(void) {
     got = frames;
   }
 
+  const size_t samples = got * DSPICO_NUM_CHANNELS;
   if (wire_bps == 2) {
-    // 16-bit fallback alt: truncate each 24-bit LE sample to its top 16 bits,
-    // in place (the destination never catches up with the source).
-    const size_t samples = got * DSPICO_NUM_CHANNELS;
+    // 16-bit alt: truncate each 24-bit LE sample to its top 16 bits. Forward
+    // in place is safe — the 2-byte destination always trails the 3-byte source.
     for (size_t s = 0; s < samples; s++) {
       s_pkt[s * 2 + 0] = s_pkt[s * 3 + 1];
       s_pkt[s * 2 + 1] = s_pkt[s * 3 + 2];
+    }
+  } else if (wire_bps == 4) {
+    // 24-in-32 alt: place the 24-bit sample left-justified (MSB-aligned) in a
+    // 4-byte LE slot with the unused low byte zero, per USB Frmts20 §2.3.1.7.1.
+    // Expanding grows the buffer, so walk it BACKWARDS (the 4-byte destination
+    // leads the 3-byte source) to avoid clobbering samples not yet copied.
+    for (size_t s = samples; s-- > 0; ) {
+      const uint8_t lsb = s_pkt[s * 3 + 0];
+      const uint8_t mid = s_pkt[s * 3 + 1];
+      const uint8_t msb = s_pkt[s * 3 + 2];
+      s_pkt[s * 4 + 0] = 0;
+      s_pkt[s * 4 + 1] = lsb;
+      s_pkt[s * 4 + 2] = mid;
+      s_pkt[s * 4 + 3] = msb;
     }
   }
   return (uint16_t)(got * wire_bpf);
@@ -703,6 +927,7 @@ static void dac_close(uint8_t dev_addr) {
   s_deferred_next = NULL;
   dlog("DSPico host: DAC disconnected\n");
   memset(&s_dac, 0, sizeof(s_dac));
+  s_desc_len = s_desc_pos = 0;   // re-dump the descriptor on the next attach
 }
 
 // ---------------------------------------------------------------------------
