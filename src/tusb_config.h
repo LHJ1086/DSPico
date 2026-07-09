@@ -49,21 +49,27 @@ extern "C" {
 #define CFG_TUH_LOG_LEVEL   0      // host stack: silent (protect core1 timing)
 extern int dspico_tusb_printf(const char *fmt, ...);
 #define CFG_TUSB_DEBUG_PRINTF dspico_tusb_printf
-#else
-// Lightweight HOST enumeration diagnostics (level 1) routed to the WebUSB log.
-// TU_LOG1 fires on errors and the key enumeration milestones ("Enumeration
-// attempt N", "Get Configuration Descriptor", "Device configured") — NOT per
-// packet — so it does not disturb the iso timing, and the sink routes core1
-// host trace through the non-blocking cross-core ring (it drops, never stalls,
-// when full). This is what makes a DAC that gets an address but never mounts
-// (the Cirrus symptom) diagnosable: the log now shows the exact step it dies
-// on. Device (core0) trace stays quiet — our own markers cover that side.
+#elif defined(DSPICO_HOST_ENUM_TRACE) && DSPICO_HOST_ENUM_TRACE
+// Optional deep host-enumeration trace (level 1): TinyUSB's own milestones and
+// errors ("Get Configuration Descriptor", "STALLED", "Enumeration attempt N")
+// routed to the WebUSB log via the non-blocking cross-core ring. Invaluable for
+// a DAC that fails BEFORE our driver sees it (a pre-config STALL), but it also
+// prints per iso transfer, which floods the log during streaming and drowns
+// our own markers — so it is OFF by default and only flipped on for a
+// bring-up session (-DDSPICO_HOST_ENUM_TRACE=1). Our own dlog markers in
+// uac_host.c (device attach, VID:PID, every format candidate with its
+// accept/reject reason, setup steps) stay on always and cover the common cases
+// without any flooding.
 #undef  CFG_TUSB_DEBUG
 #define CFG_TUSB_DEBUG      1
-#define CFG_TUD_LOG_LEVEL   0      // device side: our own markers are enough
-#define CFG_TUH_LOG_LEVEL   1      // host side: milestones + errors only
+#define CFG_TUD_LOG_LEVEL   0
+#define CFG_TUH_LOG_LEVEL   1
 extern int dspico_tusb_printf(const char *fmt, ...);
 #define CFG_TUSB_DEBUG_PRINTF dspico_tusb_printf
+#else
+#ifndef CFG_TUSB_DEBUG
+#define CFG_TUSB_DEBUG 0
+#endif
 #endif
 
 // Both native and PIO ports are Full Speed only (brief §2).

@@ -185,13 +185,25 @@ static void consider_candidate(dac_dev_t *d, const alt_cand_t *c,
   if (!c->pcm || !c->rate_ok) return;
   if (c->channels != DSPICO_NUM_CHANNELS) return;
   if (rank == 0xFF) return;                       // unsupported subslot width
-  if (ep->wMaxPacketSize > UAC_HOST_MAX_WIRE_PKT) {
-    dlog("DSPico host:   ^ rejected: maxpkt %u exceeds PIO encode limit %u\n",
-           ep->wMaxPacketSize, UAC_HOST_MAX_WIRE_PKT);
+
+  // The PIO encoder only ever stages the bytes WE put on the wire in one
+  // transaction — a single 1 ms frame (48, or 49 with async feedback) — NOT
+  // the DAC's advertised wMaxPacketSize. So the limit that matters is our own
+  // packet size, not the endpoint's maximum. Testing wMaxPacketSize here was a
+  // real bug: DACs that advertise a big OUT endpoint (ESS 772 B, KT02H02
+  // 776 B, …) were all rejected as "incompatible" even though our little
+  // 288-byte packets fit the encoder fine and they stream without issue. We
+  // send at most (48+1) frames, and pio_usb caps each transaction at the
+  // endpoint size anyway, so this can never overrun the encode buffer.
+  const uint16_t our_pkt = (uint16_t) ((DSPICO_SAMPLES_PER_MS + 1) * wire_bpf);
+  if (our_pkt > UAC_HOST_MAX_WIRE_PKT) {
+    dlog("DSPico host:   ^ rejected: our %u-byte packet exceeds PIO encode limit %u\n",
+           our_pkt, UAC_HOST_MAX_WIRE_PKT);
     return;
   }
-  // Must carry a whole 1 ms frame (48 stereo frames). A short-packet alt would
-  // starve the DAC — better to keep looking (and warn if it's all we find).
+  // The endpoint must be able to hold one whole 1 ms frame (48 stereo frames);
+  // a smaller endpoint would starve the DAC — keep looking (warn if it's all
+  // we find). Larger is fine: we simply send our 48 frames and short-packet it.
   if (max_frames < DSPICO_SAMPLES_PER_MS) {
     dlog("DSPico host:   ^ note: only %u frames/pkt (< %u) — undersized\n",
            max_frames, (unsigned) DSPICO_SAMPLES_PER_MS);
