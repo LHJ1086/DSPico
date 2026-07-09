@@ -77,10 +77,14 @@ float uac2_host_gain(void) {
 // Sending the wrong one leaves the host unable to pace the stream — on
 // Windows the audio engine wedges and every player freezes until unplug.
 //
-// Only Windows ever requests the MS OS 2.0 descriptor set, so that request
-// (seen during enumeration, before the stream opens) is a reliable Windows
-// fingerprint: switch the feedback format to 16.16/4-byte for it, keep the
-// spec 10.14/3-byte everywhere else.
+// There is no single format that satisfies both Apple and Windows, so we must
+// detect the host. The DEFAULT is Apple's 10.14/3-byte (Apple is the priority
+// and must work with zero detection). We flip to 16.16/4-byte only on a
+// positive Windows fingerprint: Windows requests the legacy 0xEE "MSFT100"
+// string descriptor during enumeration (usb_descriptors.c) — a request macOS
+// and iOS never make — so it can never mis-fire on an Apple host. (A host that
+// fetches the MS OS 2.0 set is likewise Windows; that path calls in too, but
+// at bcdUSB 2.0 the BOS isn't fetched so 0xEE is the one that actually fires.)
 // ---------------------------------------------------------------------------
 static bool s_host_is_windows;
 

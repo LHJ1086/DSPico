@@ -12,6 +12,7 @@
 #include "pico/unique_id.h"
 #include "board_config.h"
 #include "debug_log.h"
+#include "uac2_device.h"      // uac2_note_windows_host() (0xEE Windows fingerprint)
 #include "usb_descriptors.h"
 
 // A development VID/PID pair from the pid.codes test range. Replace with your
@@ -19,11 +20,16 @@
 // its output-device list (brief §6a), so make it recognisable.
 #define USB_VID   0x1209
 #define USB_PID   0xD590
-// bcdUSB 2.1: a BOS descriptor is only fetched by hosts when bcdUSB >= 0x0201.
-// With the old 0x0200, WINDOWS NEVER ASKED for the BOS, so the MS OS 2.0 set
-// never reached it, WinUSB never bound the vendor interface, and the WebUSB
-// configurator (and its diagnostic log) could not work on Windows at all.
-#define USB_BCD   0x0210
+// bcdUSB 2.0 — DELIBERATELY, and do NOT raise it. Declaring 2.1 makes macOS
+// and iOS fetch and strictly validate the BOS descriptor set before finishing
+// the audio function; anything they dislike there and they DESELECT the audio
+// device — it stops appearing as a selectable output. Apple support is the
+// critical, primary use case, so we stay at 2.0 (the value Apple was proven
+// working on). The cost is that Windows won't fetch the BOS/MS OS 2.0 set, so
+// WinUSB won't auto-bind the WebUSB config interface — a secondary feature.
+// Windows is still detected for the feedback-format fix via its legacy 0xEE
+// "MSFT100" string request, which happens at USB 2.0 (see the string cb).
+#define USB_BCD   0x0200
 
 // ---------------------------------------------------------------------------
 // Device descriptor
@@ -40,13 +46,11 @@ static tusb_desc_device_t const desc_device = {
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = USB_VID,
     .idProduct          = USB_PID,
-    // Windows caches the MS OS 2.0 / WinUSB binding AND the audio device's
-    // format/endpoint properties per VID/PID/bcdDevice. Bump this whenever the
-    // descriptor layout changes, or a stale (possibly failed) cached state
-    // sticks forever. Bumped to 0x0105 with the bcdUSB 2.1 change so hosts
-    // that cached the earlier (possibly failed) state re-read the device
-    // fresh, including the BOS/MS OS 2.0 set.
-    .bcdDevice          = 0x0105,
+    // Windows/macOS cache the audio device's format/endpoint properties per
+    // VID/PID/bcdDevice. Bump this whenever the descriptor layout changes, or
+    // a stale (possibly failed) cached state sticks forever. Bumped to 0x0106
+    // with the bcdUSB revert to 0x0200 so hosts re-read the device fresh.
+    .bcdDevice          = 0x0106,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x03,
@@ -260,6 +264,16 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
       // Derive a unique-per-board serial from the chip unique ID.
       chr_count = dspico_get_serial(_desc_str + 1, 32);
       break;
+
+    case 0xEE:
+      // Windows (and only Windows) requests string index 0xEE — the legacy
+      // "MSFT100" OS string descriptor — during enumeration. We don't serve a
+      // real MS OS 1.0 descriptor (return NULL -> STALL, handled gracefully),
+      // but the request itself is a reliable Windows fingerprint that works at
+      // bcdUSB 2.0, unlike the BOS/MS OS 2.0 path. It flips the async-feedback
+      // wire format to the 16.16/4-byte form usbaudio2.sys needs (uac2_device.c).
+      uac2_note_windows_host();
+      return NULL;
 
     default:
       if (index >= TU_ARRAY_SIZE(string_desc_arr)) return NULL;

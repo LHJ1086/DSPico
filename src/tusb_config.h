@@ -150,10 +150,15 @@ extern int dspico_tusb_printf(const char *fmt, ...);
 // Allow a DAC that sits behind a hub, plus a small device table.
 #define CFG_TUH_HUB          1
 #define CFG_TUH_DEVICE_MAX   (CFG_TUH_HUB ? 4 : 1)
-// The whole audio-function descriptor block must fit here or uac_host.c's
-// format parser can miss a valid alt setting. DACs with many alternate
-// settings easily exceed 256 bytes; RP2350 RAM affords the headroom.
-#define CFG_TUH_ENUMERATION_BUFSIZE 512
+// TinyUSB fetches the device's ENTIRE configuration descriptor into this
+// buffer during enumeration; if the descriptor is larger, enumeration FAILS
+// before the device ever mounts (address assigned, then dropped — the exact
+// "device N removed with no attach line" symptom seen with a Cirrus Logic
+// DAC). Multi-rate / multi-format UAC2 codecs (Cirrus, ESS, AKM) carry many
+// alternate settings and easily exceed 512 bytes, so budget generously —
+// RP2350 has the RAM. This also must hold the whole audio-function block or
+// uac_host.c's format parser can miss a valid alt setting.
+#define CFG_TUH_ENUMERATION_BUFSIZE 2048
 
 // Enable the raw endpoint transfer API — our custom driver uses
 // usbh_edpt_open()/usbh_edpt_xfer() to open and pump the DAC's isochronous

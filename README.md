@@ -379,10 +379,13 @@ green (streaming to DAC); red = incompatible DAC (see the table above).
 - **DAC clock tracking** — for an asynchronous DAC with a feedback endpoint,
   the host reads the DAC's requested rate and sizes packets 47/48/49 frames
   to match its clock, instead of drifting into periodic clicks.
-- **Per-OS feedback format** — the PC-facing feedback value is sent as the
-  full-speed-spec 10.14/3-byte form for macOS/iOS/Linux, but as 16.16/4-byte
-  for Windows (fingerprinted by its MS OS 2.0 request), which is the only
-  form usbaudio2.sys accepts.
+- **Per-OS feedback format** — no single full-speed feedback format works on
+  both Apple and Windows, so the host is detected. The default is Apple's
+  10.14/3-byte form (Apple/iOS is the priority and needs zero detection);
+  Windows is fingerprinted by its legacy 0xEE "MSFT100" string request and
+  gets the 16.16/4-byte form usbaudio2.sys requires. The device stays
+  **bcdUSB 2.0** — declaring 2.1 makes macOS/iOS validate the BOS set and can
+  deselect the audio device, so it is deliberately not raised.
 - **Non-blocking logging** — diagnostic lines are trickled to the UART only
   as its FIFO drains; nothing on the audio path ever blocks on 115200 baud.
 - **Overflow drops whole frames** — if the PC sends while no DAC drains, the
