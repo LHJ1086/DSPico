@@ -48,9 +48,10 @@ static tusb_desc_device_t const desc_device = {
     .idProduct          = USB_PID,
     // Windows/macOS cache the audio device's format/endpoint properties per
     // VID/PID/bcdDevice. Bump this whenever the descriptor layout changes, or
-    // a stale (possibly failed) cached state sticks forever. Bumped to 0x0106
-    // with the bcdUSB revert to 0x0200 so hosts re-read the device fresh.
-    .bcdDevice          = 0x0106,
+    // a stale (possibly failed) cached state sticks forever. Bumped to 0x0107
+    // with the switch to a 24-bit PC-facing format so hosts re-read the device
+    // fresh (a cached 16-bit format would otherwise stick).
+    .bcdDevice          = 0x0107,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x03,
@@ -169,8 +170,8 @@ static uint8_t const desc_configuration[] = {
                              /*_channelcfg*/ (AUDIO_CHANNEL_CONFIG_FRONT_LEFT | AUDIO_CHANNEL_CONFIG_FRONT_RIGHT),
                              /*_stridx*/ 0x00),
 
-    // --- Type I format: 16-bit in a 2-byte sub-slot (PC-facing) -------------
-    // 16-bit is the universally host-renderable format; see board_config.h.
+    // --- Type I format: 24-bit in a 3-byte sub-slot (PC-facing) -------------
+    // 24-bit for a bit-perfect full-resolution chain; see board_config.h.
     TUD_AUDIO_DESC_TYPE_I_FORMAT(/*_subslotsize*/ DSPICO_DEV_BYTES_PER_SAMPLE,
                                  /*_bitresolution*/ DSPICO_DEV_RESOLUTION_BITS),
 

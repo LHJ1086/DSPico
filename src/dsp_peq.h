@@ -24,12 +24,16 @@
 #define PEQ_MAX_BANDS 16
 
 // --- Allowed parameter ranges (enforced by peq_set_band) --------------------
-// Frequency 1 Hz .. 20 kHz, band gain +/-12 dB (peaking/shelf), Q 0.1 .. 10.
+// Frequency 1 Hz .. 20 kHz, band gain +/-24 dB (peaking/shelf), Q 0.1 .. 10.
 // Out-of-range values passed to peq_set_band are clamped into these bounds.
+// The gain range is +/-24 dB (was +/-12) so real AutoEQ / room-correction
+// presets — which routinely call for boosts/cuts beyond 12 dB — apply as
+// designed instead of being silently clamped. The clip guard (see below)
+// reserves matching headroom automatically, so a wider range does not clip.
 #define PEQ_FC_MIN_HZ    1.0f
 #define PEQ_FC_MAX_HZ    20000.0f
-#define PEQ_GAIN_MIN_DB  (-12.0f)
-#define PEQ_GAIN_MAX_DB  12.0f
+#define PEQ_GAIN_MIN_DB  (-24.0f)
+#define PEQ_GAIN_MAX_DB  24.0f
 #define PEQ_Q_MIN        0.1f
 #define PEQ_Q_MAX        10.0f
 

@@ -139,17 +139,17 @@ typedef struct {
   bool    have_fb;
 } alt_cand_t;
 
-// Rank of a wire sample width — lower is better. 16-bit (subslot 2) is the
-// PROVEN-AUDIBLE format over the patched PIO host; native 24-bit (3) and
-// 24-in-32 (4) stream but were still under investigation in the field, so we
-// keep 16-bit as the default choice while accepting the wider formats when a
-// DAC offers nothing else (a headset codec that only advertises 32-bit would
-// otherwise read as "incompatible").
+// Rank of a wire sample width — lower is better. Native 24-bit (subslot 3) is
+// now PREFERRED: the whole chain (PC -> EQ -> DAC) is 24-bit, so matching the
+// DAC at 24-bit keeps it bit-perfect with no width conversion and no loss of
+// the EQ/volume precision. 24-in-32 (4) is the next-cleanest (same 24 bits,
+// just left-justified in 4 bytes); 16-bit (2) is the last resort — used only
+// for DACs that offer nothing wider, and it costs a 24->16 reduction.
 static uint8_t subslot_rank(uint8_t subslot) {
   switch (subslot) {
-    case 2:  return 0;   // 16-bit: proven
-    case 3:  return 1;   // 24-bit packed
-    case 4:  return 2;   // 24-in-32
+    case 3:  return 0;   // 24-bit packed: bit-perfect with our 24-bit path
+    case 4:  return 1;   // 24-in-32: same 24 bits, left-justified
+    case 2:  return 2;   // 16-bit: last resort (24->16 reduction)
     default: return 0xFF;
   }
 }
@@ -596,14 +596,16 @@ static void finish_setup(void);
 
 // Volume target (1/256 dB units), resolved per-DAC before the writes: the
 // setup chain asks the DAC for its own volume RANGE (UAC2 RANGE / UAC1
-// GET_MAX) and targets that maximum, capped at +12 dB for safety. Writing the
-// DAC's own bMax is what maximises loudness on codecs whose range tops out
-// above 0 dB, and — just as important — never writes an out-of-range value,
-// which quirky codecs answer with a NAK-forever wedge instead of a STALL.
-// When the range can't be read the target falls back to 0 dB (nominal full
-// output, within range on virtually every DAC).
+// GET_MAX) and targets THAT MAXIMUM — the loudest the DAC itself permits —
+// because that is exactly what maximises output on codecs (like the CX31988)
+// whose range tops out above 0 dB, and it can never be out-of-range (quirky
+// codecs answer an out-of-range write with a NAK-forever wedge, not a STALL).
+// The only ceiling is a garbage guard against a mis-read absurd value; it is
+// well above any real DAC's max so it never actually limits loudness. When the
+// range can't be read the target falls back to 0 dB (unity, in range on any
+// DAC). The measured max is logged so it's verifiable from the WebUSB log.
 static int16_t s_fu_vol_target;
-#define FU_VOLUME_CAP_DB256   (12 * 256)
+#define FU_VOLUME_CAP_DB256   (30 * 256)   // garbage guard only, not a real limit
 
 // The step list, built by build_fu_steps() from the resolved FU's control map.
 // Room for master + stereo, each with a mute and a volume control.

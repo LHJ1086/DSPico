@@ -26,7 +26,7 @@ const TYPE = { PEAKING:0, LOWSHELF:1, HIGHSHELF:2, LOWPASS:3, HIGHPASS:4 };
 const TYPE_NAME = ['Peaking','Low shelf','High shelf','Low pass','High pass'];
 
 // Allowed ranges — match dsp_peq.h.
-const LIMIT = { FC_MIN:1, FC_MAX:20000, GAIN_MIN:-12, GAIN_MAX:12, Q_MIN:0.1, Q_MAX:10 };
+const LIMIT = { FC_MIN:1, FC_MAX:20000, GAIN_MIN:-24, GAIN_MAX:24, Q_MIN:0.1, Q_MAX:10 };
 let MAX_BANDS = 16;         // updated from device INFO when connected
 let SAMPLE_RATE = 48000;    // updated from device INFO when connected
 
@@ -192,7 +192,7 @@ function renderBands() {
         TYPE_NAME.map((n,ti)=>`<option value="${ti}" ${b.type===ti?'selected':''}>${n}</option>`).join('')
       }</select></td>
       <td><input class="num" type="number" step="1"   min="1" max="20000" value="${b.fc}"   data-i="${i}" data-k="fc"></td>
-      <td><input class="num" type="number" step="0.1" min="-12" max="12"  value="${b.gain}" data-i="${i}" data-k="gain"></td>
+      <td><input class="num" type="number" step="0.1" min="-24" max="24"  value="${b.gain}" data-i="${i}" data-k="gain"></td>
       <td><input class="num" type="number" step="0.05" min="0.1" max="10" value="${b.q}"    data-i="${i}" data-k="q"></td>
       <td><button data-i="${i}" data-k="del">✕</button></td>`;
     tb.appendChild(tr);

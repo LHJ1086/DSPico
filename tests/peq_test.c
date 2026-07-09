@@ -200,13 +200,13 @@ static void test_clamp(void) {
   peq_band_t hi = { .enabled = true, .type = PEQ_PEAKING, .fc = 1e9f, .gain_db = 99.0f, .q = 99.0f };
   peq_set_band(&p, 0, &hi);
   check_close(p.band[0].fc,      PEQ_FC_MAX_HZ,   0.0f, "fc clamps to 20 kHz");
-  check_close(p.band[0].gain_db, PEQ_GAIN_MAX_DB, 0.0f, "gain clamps to +12 dB");
+  check_close(p.band[0].gain_db, PEQ_GAIN_MAX_DB, 0.0f, "gain clamps to +24 dB");
   check_close(p.band[0].q,       PEQ_Q_MAX,       0.0f, "Q clamps to 10");
 
   peq_band_t lo = { .enabled = true, .type = PEQ_PEAKING, .fc = 0.001f, .gain_db = -99.0f, .q = 1e-4f };
   peq_set_band(&p, 1, &lo);
   check_close(p.band[1].fc,      PEQ_FC_MIN_HZ,   0.0f, "fc clamps to 1 Hz");
-  check_close(p.band[1].gain_db, PEQ_GAIN_MIN_DB, 0.0f, "gain clamps to -12 dB");
+  check_close(p.band[1].gain_db, PEQ_GAIN_MIN_DB, 0.0f, "gain clamps to -24 dB");
   check_close(p.band[1].q,       PEQ_Q_MIN,       0.0f, "Q clamps to 0.1");
 
   // Out-of-bounds slot index must be a safe no-op, not a buffer overrun.
@@ -288,6 +288,11 @@ static void test_peaking_center_gain(void) {
   check_close(measure_gain_db(&p, 1000.0f), -12.0f, 0.35f, "-12 dB @ 1 kHz, Q0.1");
   one_band(&p, PEQ_PEAKING, 1000.0f, 12.0f, 10.0f);
   check_close(measure_gain_db(&p, 1000.0f), 12.0f, 0.35f, "+12 dB @ 1 kHz, Q10");
+  // The widened range must stay just as accurate at its new extremes.
+  one_band(&p, PEQ_PEAKING, 1000.0f, 24.0f, 1.0f);
+  check_close(measure_gain_db(&p, 1000.0f), 24.0f, 0.35f, "+24 dB @ 1 kHz, Q1 (range max)");
+  one_band(&p, PEQ_PEAKING, 1000.0f, -24.0f, 4.0f);
+  check_close(measure_gain_db(&p, 1000.0f), -24.0f, 0.35f, "-24 dB @ 1 kHz, Q4 (range min)");
 }
 
 static void test_peaking_flat_away(void) {

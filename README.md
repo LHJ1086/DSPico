@@ -373,9 +373,18 @@ green (streaming to DAC); red = incompatible DAC (see the table above).
   stream, priming, or a momentary underrun) the DAC is fed silent packets.
   The bridge never generates sound of its own; the old bring-up test tone is
   gone.
+- **Bit-perfect 24-bit chain** — the PC-facing input, the internal path, and
+  the DAC output are all 24-bit, and the host driver prefers the DAC's 24-bit
+  alt. With a flat EQ and unity volume the audio is passed through bit-for-bit
+  (a zero-DSP fast path); with EQ/volume active the float result is written at
+  full 24-bit width, so nothing is re-quantised to 16-bit on the way out.
 - **Clip guard** — the EQ engine automatically reserves headroom equal to the
   largest band boost (effective pre-gain = min(user pre-gain, −max boost)),
-  so a boosted band driven by full-scale audio no longer hard-clips.
+  so a boosted band driven by full-scale audio no longer hard-clips. Band gain
+  ranges ±24 dB so AutoEQ/room-correction presets apply as designed.
+- **DAC volume** — at setup the host reads the DAC's own volume range and sets
+  it to that maximum (not a fixed −12/0 dB), so codecs that allow more than
+  0 dB run at their full output. The measured max is in the WebUSB log.
 - **DAC clock tracking** — for an asynchronous DAC with a feedback endpoint,
   the host reads the DAC's requested rate and sizes packets 47/48/49 frames
   to match its clock, instead of drifting into periodic clicks.

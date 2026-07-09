@@ -106,8 +106,8 @@ extern int dspico_tusb_printf(const char *fmt, ...);
 #define CFG_TUD_AUDIO_ENABLE_EP_OUT       1
 #define CFG_TUD_AUDIO_ENABLE_EP_IN        0
 
-// PC-facing RX format is 16-bit (see board_config.h); RX expands to the
-// internal 24-bit path.
+// PC-facing RX format is 24-bit (see board_config.h) — same width as the
+// internal path, so RX pushes samples straight through with no conversion.
 #define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX          DSPICO_NUM_CHANNELS
 #define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX  DSPICO_DEV_BYTES_PER_SAMPLE
 

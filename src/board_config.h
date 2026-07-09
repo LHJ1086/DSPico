@@ -71,15 +71,15 @@
 #define DSPICO_BYTES_PER_SAMPLE 3u        // 24-bit packed (internal + DAC side)
 #define DSPICO_RESOLUTION_BITS  24u
 
-// PC-facing (device) wire format: 16-bit. This is the format the proven
-// TinyUSB uac2_speaker_fb example uses and the one Windows' shared-mode audio
-// engine renders universally — a 24-bit-only device enumerates and shows a
-// volume slider but the OS silently never opens the stream. RX expands each
-// 16-bit sample to the internal 24-bit format (value << 8, i.e. [0, lo, hi]);
-// the DAC side already truncates back to 16-bit for DACs that need it, so no
-// resolution is lost end-to-end.
-#define DSPICO_DEV_BYTES_PER_SAMPLE 2u
-#define DSPICO_DEV_RESOLUTION_BITS  16u
+// PC-facing (device) wire format: 24-bit, matching the internal path and the
+// DAC side for a TRUE bit-perfect 24-bit chain end-to-end (PC -> EQ -> DAC)
+// with no width conversion anywhere when the EQ is flat. 16-bit was used
+// earlier because Windows' shared-mode engine is fussy about 24-bit-only
+// devices, but Apple (the primary target) handles 24/48 UAC2 natively, and a
+// 16-bit wire was capping resolution and audibly muddying hi-res material.
+// RX now pushes the received 24-bit samples straight into the signal path.
+#define DSPICO_DEV_BYTES_PER_SAMPLE 3u
+#define DSPICO_DEV_RESOLUTION_BITS  24u
 
 // One 1 ms USB frame's worth of audio (nominal). At 48 kHz that is 48
 // samples/frame/channel. We size ring buffers generously around this.

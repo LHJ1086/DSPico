@@ -146,24 +146,18 @@ bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received,
                                     uint8_t func_id, uint8_t ep_out, uint8_t cur_alt_setting) {
   (void) rhport; (void) func_id; (void) ep_out; (void) cur_alt_setting;
 
-  // The PC sends 16-bit LE samples; the internal signal path is 24-bit. Expand
-  // each 16-bit sample to 24-bit (value << 8, i.e. [0, lo, hi]) before pushing.
-  static uint8_t rx16[CFG_TUD_AUDIO_EP_SZ_OUT];              // as received (16-bit)
-  static uint8_t s24[CFG_TUD_AUDIO_EP_SZ_OUT / 2 * 3];       // expanded (24-bit)
+  // The PC now sends native 24-bit LE samples — the same width as the internal
+  // signal path and the DAC side — so they go straight in with no conversion
+  // (the old 16->24 expansion is gone). signal_path_push_capture EQs in place
+  // and enqueues toward the DAC; it carries any frame-partial tail internally.
+  static uint8_t rx[CFG_TUD_AUDIO_EP_SZ_OUT];
   uint16_t remaining = n_bytes_received;
   while (remaining) {
-    const uint16_t chunk = remaining > sizeof(rx16) ? (uint16_t) sizeof(rx16) : remaining;
-    const uint16_t got = tud_audio_read(rx16, chunk);
+    const uint16_t chunk = remaining > sizeof(rx) ? (uint16_t) sizeof(rx) : remaining;
+    const uint16_t got = tud_audio_read(rx, chunk);
     if (got == 0) break;
     remaining -= got;
-
-    const uint16_t nsamp = got / 2;                          // 16-bit samples
-    for (uint16_t i = 0; i < nsamp; i++) {
-      s24[i * 3 + 0] = 0;                                    // low byte (padding)
-      s24[i * 3 + 1] = rx16[i * 2 + 0];                      // 16-bit LSB
-      s24[i * 3 + 2] = rx16[i * 2 + 1];                      // 16-bit MSB
-    }
-    signal_path_push_capture(s24, (uint32_t) nsamp * 3);     // EQ + enqueue toward the DAC
+    signal_path_push_capture(rx, got);
   }
   s_rx_total_bytes += n_bytes_received;
   return true;
