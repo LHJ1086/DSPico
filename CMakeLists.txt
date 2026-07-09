@@ -63,6 +63,15 @@ if(DSPICO_BOARD_USB_CM)
     target_compile_definitions(dspico PRIVATE DSPICO_BOARD_USB_CM=1)
 endif()
 
+# Diagnostic: verbose TinyUSB host-enumeration trace into the WebUSB log
+# (see src/tusb_config.h). OFF by default — it prints per iso transfer and
+# floods during streaming. Turn on for a bring-up session to see exactly which
+# enumeration step a stubborn DAC dies on: -DDSPICO_HOST_ENUM_TRACE=ON.
+option(DSPICO_HOST_ENUM_TRACE "Verbose USB host enumeration trace" OFF)
+if(DSPICO_HOST_ENUM_TRACE)
+    target_compile_definitions(dspico PRIVATE DSPICO_HOST_ENUM_TRACE=1)
+endif()
+
 # Generate ws2812.pio.h from the PIO source (uses the SDK's pioasm).
 pico_generate_pio_header(dspico ${CMAKE_CURRENT_LIST_DIR}/src/ws2812.pio)
 
