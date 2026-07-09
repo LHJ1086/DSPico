@@ -139,17 +139,19 @@ typedef struct {
   bool    have_fb;
 } alt_cand_t;
 
-// Rank of a wire sample width — lower is better. Native 24-bit (subslot 3) is
-// now PREFERRED: the whole chain (PC -> EQ -> DAC) is 24-bit, so matching the
-// DAC at 24-bit keeps it bit-perfect with no width conversion and no loss of
-// the EQ/volume precision. 24-in-32 (4) is the next-cleanest (same 24 bits,
-// just left-justified in 4 bytes); 16-bit (2) is the last resort — used only
-// for DACs that offer nothing wider, and it costs a 24->16 reduction.
+// Rank of a wire sample width — lower is better. 16-bit (subslot 2) is
+// PREFERRED again: over the bit-banged PIO host it is the proven-reliable
+// format — its packets are the smallest (192 B/frame vs 288 for 24-bit), which
+// the software USB encoder streams cleanly. 24-bit was tried as the default
+// for a bit-perfect output chain, but on real DACs (e.g. KT02H02) the larger
+// 24-bit iso packets stuttered/clicked over PIO. 24-bit (3) and 24-in-32 (4)
+// remain accepted as fallbacks for DACs that offer nothing narrower. The PC
+// input stays 24-bit either way; only the final DAC leg drops to 16-bit here.
 static uint8_t subslot_rank(uint8_t subslot) {
   switch (subslot) {
-    case 3:  return 0;   // 24-bit packed: bit-perfect with our 24-bit path
-    case 4:  return 1;   // 24-in-32: same 24 bits, left-justified
-    case 2:  return 2;   // 16-bit: last resort (24->16 reduction)
+    case 2:  return 0;   // 16-bit: proven-reliable over the PIO host
+    case 3:  return 1;   // 24-bit packed: fallback
+    case 4:  return 2;   // 24-in-32: fallback
     default: return 0xFF;
   }
 }
