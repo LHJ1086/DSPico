@@ -108,13 +108,15 @@ void dlog0(const char *fmt, ...) {
   for (int i = 0; i < n; i++) ulog_push((uint8_t) line[i]);   // core0-only buffer
 }
 
-// TinyUSB internal-trace sink (wired via CFG_TUSB_DEBUG_PRINTF). The DEVICE
-// stack runs on core0, so its trace goes to the WebUSB log buffer to expose
-// SET_INTERFACE / endpoint-open behaviour during bring-up. HOST-stack trace
-// (core1) is dropped before any formatting so it cannot add latency to the
-// timing-critical PIO-USB path.
+// TinyUSB internal-trace sink (wired via CFG_TUSB_DEBUG_PRINTF). BOTH stacks'
+// trace reaches the WebUSB log, but by different routes so the timing-critical
+// PIO-USB path is never stalled:
+//   * DEVICE stack (core0): straight into the UART-queue + WebUSB buffer.
+//   * HOST stack (core1): into the cross-core ring (same path as dlog), which
+//     is non-blocking — it DROPS when full rather than waiting, so trace can
+//     never add latency to core1's USB frame servicing. Host trace is kept to
+//     level 1 (milestones + errors, see tusb_config.h) so it stays sparse.
 int dspico_tusb_printf(const char *fmt, ...) {
-  if (get_core_num() != 0) return 0;            // drop host (core1) trace
   char line[160];
   va_list ap;
   va_start(ap, fmt);
@@ -122,8 +124,12 @@ int dspico_tusb_printf(const char *fmt, ...) {
   va_end(ap);
   if (n <= 0) return 0;
   if (n > (int) sizeof line) n = (int) sizeof line;
-  txring_push((const uint8_t *) line, (uint32_t) n);          // UART (queued)
-  for (int i = 0; i < n; i++) ulog_push((uint8_t) line[i]);   // WebUSB log
+  if (get_core_num() == 0) {
+    txring_push((const uint8_t *) line, (uint32_t) n);          // UART (queued)
+    for (int i = 0; i < n; i++) ulog_push((uint8_t) line[i]);   // WebUSB log
+  } else {
+    xring_write((const uint8_t *) line, (uint32_t) n);          // core1 -> core0 -> log
+  }
   return n;
 }
 

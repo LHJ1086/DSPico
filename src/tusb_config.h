@@ -50,9 +50,20 @@ extern "C" {
 extern int dspico_tusb_printf(const char *fmt, ...);
 #define CFG_TUSB_DEBUG_PRINTF dspico_tusb_printf
 #else
-#ifndef CFG_TUSB_DEBUG
-#define CFG_TUSB_DEBUG 0
-#endif
+// Lightweight HOST enumeration diagnostics (level 1) routed to the WebUSB log.
+// TU_LOG1 fires on errors and the key enumeration milestones ("Enumeration
+// attempt N", "Get Configuration Descriptor", "Device configured") — NOT per
+// packet — so it does not disturb the iso timing, and the sink routes core1
+// host trace through the non-blocking cross-core ring (it drops, never stalls,
+// when full). This is what makes a DAC that gets an address but never mounts
+// (the Cirrus symptom) diagnosable: the log now shows the exact step it dies
+// on. Device (core0) trace stays quiet — our own markers cover that side.
+#undef  CFG_TUSB_DEBUG
+#define CFG_TUSB_DEBUG      1
+#define CFG_TUD_LOG_LEVEL   0      // device side: our own markers are enough
+#define CFG_TUH_LOG_LEVEL   1      // host side: milestones + errors only
+extern int dspico_tusb_printf(const char *fmt, ...);
+#define CFG_TUSB_DEBUG_PRINTF dspico_tusb_printf
 #endif
 
 // Both native and PIO ports are Full Speed only (brief §2).
@@ -158,7 +169,7 @@ extern int dspico_tusb_printf(const char *fmt, ...);
 // alternate settings and easily exceed 512 bytes, so budget generously —
 // RP2350 has the RAM. This also must hold the whole audio-function block or
 // uac_host.c's format parser can miss a valid alt setting.
-#define CFG_TUH_ENUMERATION_BUFSIZE 2048
+#define CFG_TUH_ENUMERATION_BUFSIZE 4096
 
 // Enable the raw endpoint transfer API — our custom driver uses
 // usbh_edpt_open()/usbh_edpt_xfer() to open and pump the DAC's isochronous

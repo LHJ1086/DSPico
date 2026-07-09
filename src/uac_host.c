@@ -375,7 +375,15 @@ void tuh_mount_cb(uint8_t daddr) {
 }
 
 void tuh_umount_cb(uint8_t daddr) {
-  dlog("DSPico host: device %u removed\n", daddr);
+  // Log the VID:PID even here: for a device that got an address but never
+  // configured (the Cirrus symptom), these are already populated from its
+  // device descriptor, so a nonzero pair means it enumerated far enough to be
+  // identified and is failing at the configuration stage — while 0000:0000
+  // means it died before even the device descriptor (power/signal). Combined
+  // with the host TU_LOG1 milestones this pins down where a DAC drops out.
+  uint16_t vid = 0, pid = 0;
+  tuh_vid_pid_get(daddr, &vid, &pid);
+  dlog("DSPico host: device %u removed (VID:PID %04X:%04X)\n", daddr, vid, pid);
 }
 
 static bool dac_init(void) {
