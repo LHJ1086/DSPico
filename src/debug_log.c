@@ -5,7 +5,40 @@
 #include <stdio.h>
 
 #include "pico.h"            // get_core_num()
+#include "hardware/uart.h"
 #include "debug_log.h"
+
+// --- Non-blocking UART mirror ------------------------------------------------
+// printf() to the stdio UART BLOCKS once the 32-byte hardware FIFO fills: at
+// 115200 baud a single ~90-char heartbeat line stalls the calling core for
+// 5-8 ms. On core0 that freezes tud_task(), the audio OUT endpoint isn't
+// re-armed in time, and the PC's isochronous packets of those milliseconds
+// are lost — audible as a periodic TICK in playback. So nothing here ever
+// calls printf: bytes are queued in a TX ring and pushed to the UART only
+// while its FIFO has room (uart_is_writable), a few bytes per loop pass.
+#define TXRING_CAP 4096u
+static uint8_t  t_buf[TXRING_CAP];
+static uint32_t t_head, t_tail;   // core0 only
+
+static void txring_putc(uint8_t c) {
+  if (t_head - t_tail >= TXRING_CAP) return;      // full: drop (never block)
+  t_buf[t_head++ & (TXRING_CAP - 1)] = c;
+}
+
+static void txring_push(const uint8_t *s, uint32_t n) {
+  for (uint32_t i = 0; i < n; i++) {
+    if (s[i] == '\n') txring_putc('\r');          // terminal-friendly CRLF
+    txring_putc(s[i]);
+  }
+}
+
+static void txring_drain(void) {
+#ifdef uart_default
+  while (t_tail != t_head && uart_is_writable(uart_default)) {
+    uart_putc_raw(uart_default, (char) t_buf[t_tail++ & (TXRING_CAP - 1)]);
+  }
+#endif
+}
 
 // --- core1 -> core0 ring (SPSC, acquire/release like audio_ring.h) ----------
 #define XRING_CAP 2048u
@@ -50,14 +83,16 @@ void dlog_task(void) {
   const uint32_t tail = x_tail;
   const uint32_t head = __atomic_load_n(&x_head, __ATOMIC_ACQUIRE);
   uint32_t avail = head - tail;
-  if (avail == 0) return;
   if (avail > sizeof tmp) avail = sizeof tmp;
   for (uint32_t i = 0; i < avail; i++) {
     tmp[i] = x_buf[(tail + i) & (XRING_CAP - 1)];
     ulog_push(tmp[i]);
   }
-  __atomic_store_n(&x_tail, tail + avail, __ATOMIC_RELEASE);
-  printf("%.*s", (int) avail, tmp);             // mirror to the UART
+  if (avail) {
+    __atomic_store_n(&x_tail, tail + avail, __ATOMIC_RELEASE);
+    txring_push(tmp, avail);                    // mirror to the UART (queued)
+  }
+  txring_drain();                               // a few bytes/pass, never blocks
 }
 
 void dlog0(const char *fmt, ...) {
@@ -68,15 +103,16 @@ void dlog0(const char *fmt, ...) {
   va_end(ap);
   if (n <= 0) return;
   if (n > (int) sizeof line) n = (int) sizeof line;
-  printf("%.*s", n, line);                      // UART immediately
+  txring_push((const uint8_t *) line, (uint32_t) n);          // UART (queued)
+  txring_drain();                               // opportunistic, non-blocking
   for (int i = 0; i < n; i++) ulog_push((uint8_t) line[i]);   // core0-only buffer
 }
 
 // TinyUSB internal-trace sink (wired via CFG_TUSB_DEBUG_PRINTF). The DEVICE
-// stack runs on core0, so its trace goes straight to the WebUSB log buffer to
-// expose SET_INTERFACE / endpoint-open behaviour during bring-up. HOST-stack
-// trace (core1) is dropped before any formatting so it cannot add latency to
-// the timing-critical PIO-USB path.
+// stack runs on core0, so its trace goes to the WebUSB log buffer to expose
+// SET_INTERFACE / endpoint-open behaviour during bring-up. HOST-stack trace
+// (core1) is dropped before any formatting so it cannot add latency to the
+// timing-critical PIO-USB path.
 int dspico_tusb_printf(const char *fmt, ...) {
   if (get_core_num() != 0) return 0;            // drop host (core1) trace
   char line[160];
@@ -86,7 +122,7 @@ int dspico_tusb_printf(const char *fmt, ...) {
   va_end(ap);
   if (n <= 0) return 0;
   if (n > (int) sizeof line) n = (int) sizeof line;
-  printf("%.*s", n, line);                      // UART
+  txring_push((const uint8_t *) line, (uint32_t) n);          // UART (queued)
   for (int i = 0; i < n; i++) ulog_push((uint8_t) line[i]);   // WebUSB log
   return n;
 }

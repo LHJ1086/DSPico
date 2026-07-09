@@ -26,4 +26,9 @@ void uac2_feedback_task(void);
 // (mount/stream state + bytes received from the PC) for field diagnosis.
 void uac2_device_task(void);
 
+// Called by the vendor control handler when the host requests the MS OS 2.0
+// descriptor set — only Windows does, and Windows needs the 16.16/4-byte
+// feedback format instead of the full-speed-spec 10.14/3-byte one.
+void uac2_note_windows_host(void);
+
 #endif // DSPICO_UAC2_DEVICE_H

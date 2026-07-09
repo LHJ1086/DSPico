@@ -21,8 +21,10 @@
 // dropped rather than blocking.
 void dlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-// Same, but for CORE0 producers (device-stack events, boot banner): goes
-// straight to the UART and the USB buffer, no cross-core ring involved.
+// Same, but for CORE0 producers (device-stack events, boot banner). Never
+// blocks: the UART mirror is queued and trickled out by dlog_task() only
+// while the UART FIFO has room (a blocking printf stalls tud_task for
+// milliseconds and drops audio — the old periodic-tick bug).
 void dlog0(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // core0 main loop: forward pending log bytes to the UART and the USB buffer.

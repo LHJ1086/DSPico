@@ -122,7 +122,12 @@ extern int dspico_tusb_printf(const char *fmt, ...);
 
 // --- Explicit feedback endpoint (async) ------------------------------------
 // The DAC is the clock master; we report our fill level so the PC slaves its
-// send rate to us (brief §5). Full Speed needs the 10.14 -> 16.16 format fixup.
+// send rate to us (brief §5). The WIRE FORMAT of the feedback value is picked
+// at runtime by tud_audio_feedback_format_correction_cb (uac2_device.c):
+// 10.14/3-byte for macOS/iOS/Linux, 16.16/4-byte for Windows (fingerprinted
+// by its MS OS 2.0 request) — usbaudio2.sys can't read the 10.14 form and
+// the Windows audio engine hangs on it. The macro below is only the weak
+// default; the callback supersedes it.
 #define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP                 1
 #define CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION  1
 

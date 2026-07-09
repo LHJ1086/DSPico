@@ -69,6 +69,36 @@ float uac2_host_gain(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Host-OS quirk: feedback wire format.
+//
+// TinyUSB's own field notes (audiod_fb_send) show full-speed hosts disagree
+// about the feedback format: Linux/macOS/iOS accept the spec's 10.14 in
+// 3 bytes, but WINDOWS (usbaudio2.sys) only works with 16.16 in 4 bytes.
+// Sending the wrong one leaves the host unable to pace the stream — on
+// Windows the audio engine wedges and every player freezes until unplug.
+//
+// Only Windows ever requests the MS OS 2.0 descriptor set, so that request
+// (seen during enumeration, before the stream opens) is a reliable Windows
+// fingerprint: switch the feedback format to 16.16/4-byte for it, keep the
+// spec 10.14/3-byte everywhere else.
+// ---------------------------------------------------------------------------
+static bool s_host_is_windows;
+
+void uac2_note_windows_host(void) {
+  if (!s_host_is_windows) {
+    s_host_is_windows = true;
+    dlog0("DSPico device: MS OS 2.0 request seen — Windows host, feedback 16.16/4B\n");
+  }
+}
+
+// TinyUSB samples this when the stream interface opens (alt 1): true = apply
+// the FS 10.14/3-byte correction, false = send the raw 16.16 in 4 bytes.
+bool tud_audio_feedback_format_correction_cb(uint8_t func_id) {
+  (void) func_id;
+  return !s_host_is_windows;
+}
+
+// ---------------------------------------------------------------------------
 // Streaming start/stop
 // ---------------------------------------------------------------------------
 bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_request) {

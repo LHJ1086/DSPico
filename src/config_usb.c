@@ -191,6 +191,7 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     case VENDOR_REQUEST_MICROSOFT:
       if (stage != CONTROL_STAGE_SETUP) return true;
       if (request->wIndex == 7) {
+        uac2_note_windows_host();   // only Windows asks — switch feedback format
         uint16_t len; const uint8_t *desc = dspico_desc_ms_os_20(&len);
         return tud_control_xfer(rhport, request, (void *) desc, len);
       }

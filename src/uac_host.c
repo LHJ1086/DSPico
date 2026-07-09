@@ -361,6 +361,23 @@ static void parse_audio_function(dac_dev_t *d, uint8_t const *p, uint16_t len) {
 // ---------------------------------------------------------------------------
 // TinyUSB host class-driver callbacks
 // ---------------------------------------------------------------------------
+// Every device that completes enumeration lands here (TinyUSB weak callback),
+// even ones no driver claims. This makes "my DAC isn't recognized" diagnosable
+// from the log alone: no line at all = enumeration itself failed (signal /
+// power / speed problem on the PIO port); a line but no audio-attach line =
+// the device enumerated but offered no audio interface we could claim.
+void tuh_mount_cb(uint8_t daddr) {
+  uint16_t vid = 0, pid = 0;
+  tuh_vid_pid_get(daddr, &vid, &pid);
+  dlog("DSPico host: device enumerated (addr %u, VID:PID %04X:%04X)%s\n",
+         daddr, vid, pid,
+         (s_dac.in_use && s_dac.dev_addr == daddr) ? "" : " — no audio interface claimed");
+}
+
+void tuh_umount_cb(uint8_t daddr) {
+  dlog("DSPico host: device %u removed\n", daddr);
+}
+
 static bool dac_init(void) {
   memset(&s_dac, 0, sizeof(s_dac));
   s_desc_len = s_desc_pos = 0;
@@ -419,8 +436,11 @@ static void on_set_freq_complete(tuh_xfer_t *xfer);
 // UAC1 sample-rate SET_CUR and a post-STALL Feature-Unit write that never
 // completed). Every chain step arms a deadline; uac_host_task() — called from
 // the core1 loop — aborts the stuck transfer and runs the step's timeout
-// continuation, so setup always terminates.
-#define SETUP_STEP_TIMEOUT_MS 600u
+// continuation, so setup always terminates. 300 ms per step keeps even a
+// worst-case chain (every step NAK-forever) under a few seconds total, so a
+// quirky DAC reaches its verdict (streaming or incompatible) quickly instead
+// of looking dead.
+#define SETUP_STEP_TIMEOUT_MS 300u
 
 static void (*s_timeout_next)(void);
 static uint32_t s_step_deadline_ms;        // 0 = no step pending
@@ -536,9 +556,9 @@ static void after_clocks_done(void) {
 static void timeout_rate(void) {
   // A NAK-forever rate request may still succeed on a retry once the DAC has
   // settled (the audible symptom of an unset rate is wrong-pitch playback) —
-  // try a couple more times before moving on to the next clock / step.
-  if (++s_rate_tries < 3) {
-    dlog("DSPico host: retrying sample-rate set (%u/3)\n", (unsigned) (s_rate_tries + 1));
+  // try once more before moving on to the next clock / step.
+  if (++s_rate_tries < 2) {
+    dlog("DSPico host: retrying sample-rate set (%u/2)\n", (unsigned) (s_rate_tries + 1));
     if (setup_is_uac2()) send_set_rate_current_clock();
     else                 send_set_sample_rate_uac1();
     return;
@@ -574,13 +594,16 @@ static bool setup_is_uac2(void) {
 // streamed silently. The step list is now built from the parsed control map.
 static void finish_setup(void);
 
-// Volume target: 0 dB (1/256 dB units) — the DAC's nominal full output, which
-// is what every real host sets after enumeration. Anything less permanently
-// caps the bridge's maximum loudness and eats the headroom users need to hear
-// EQ differences (the earlier -12 dB did exactly that). The OS volume on the
-// PC side still scales the stream, and the PEQ clip guard owns EQ headroom.
-// If a marginal bus-powered amp browns out at full output, lower this.
-#define FU_VOLUME_TARGET ((uint16_t)(int16_t)(0 * 256))
+// Volume target (1/256 dB units), resolved per-DAC before the writes: the
+// setup chain asks the DAC for its own volume RANGE (UAC2 RANGE / UAC1
+// GET_MAX) and targets that maximum, capped at +12 dB for safety. Writing the
+// DAC's own bMax is what maximises loudness on codecs whose range tops out
+// above 0 dB, and — just as important — never writes an out-of-range value,
+// which quirky codecs answer with a NAK-forever wedge instead of a STALL.
+// When the range can't be read the target falls back to 0 dB (nominal full
+// output, within range on virtually every DAC).
+static int16_t s_fu_vol_target;
+#define FU_VOLUME_CAP_DB256   (12 * 256)
 
 // The step list, built by build_fu_steps() from the resolved FU's control map.
 // Room for master + stereo, each with a mute and a volume control.
@@ -602,7 +625,8 @@ static void build_fu_steps(void) {
     for (uint8_t ch = 0; ch < FU_MAX_CH; ch++)
       s_fu_steps[s_fu_nsteps++] = (fu_step_t){ AUDIO_FU_CTRL_MUTE, ch, 1, 0 };
     for (uint8_t ch = 0; ch < FU_MAX_CH; ch++)
-      s_fu_steps[s_fu_nsteps++] = (fu_step_t){ AUDIO_FU_CTRL_VOLUME, ch, 2, FU_VOLUME_TARGET };
+      s_fu_steps[s_fu_nsteps++] = (fu_step_t){ AUDIO_FU_CTRL_VOLUME, ch, 2,
+                                               (uint16_t) s_fu_vol_target };
     return;
   }
   // UAC2: emit only controls the FU actually implements (bits 0-1 Mute,
@@ -612,7 +636,8 @@ static void build_fu_steps(void) {
       s_fu_steps[s_fu_nsteps++] = (fu_step_t){ AUDIO_FU_CTRL_MUTE, ch, 1, 0 };
   for (uint8_t ch = 0; ch < s_dac.fu_ctrl_nch; ch++)
     if (s_dac.fu_ctrl_sel[ch] & 0x0C)
-      s_fu_steps[s_fu_nsteps++] = (fu_step_t){ AUDIO_FU_CTRL_VOLUME, ch, 2, FU_VOLUME_TARGET };
+      s_fu_steps[s_fu_nsteps++] = (fu_step_t){ AUDIO_FU_CTRL_VOLUME, ch, 2,
+                                               (uint16_t) s_fu_vol_target };
 }
 
 static void on_fu_step_complete(tuh_xfer_t *xfer) {
@@ -620,7 +645,7 @@ static void on_fu_step_complete(tuh_xfer_t *xfer) {
   disarm_step_watchdog();
   const uint8_t i = s_fu_step - 1;
   dlog("DSPico host: FU %u %s ch%u -> %s\n", s_dac.fu_id,
-         s_fu_steps[i].sel == AUDIO_FU_CTRL_MUTE ? "unmute" : "vol 0dB",
+         s_fu_steps[i].sel == AUDIO_FU_CTRL_MUTE ? "unmute" : "set-volume",
          s_fu_steps[i].ch,
          xfer->result == XFER_RESULT_SUCCESS ? "OK" : "stalled (not implemented)");
   schedule_step(fu_send_next);   // pace control requests (dongle quirk)
@@ -662,22 +687,99 @@ static void fu_send_next(void) {
   }
 }
 
-static void start_fu_init(void) {
+// Build and send the mute/volume steps once the volume target is resolved.
+static void fu_begin_steps(void) {
   build_fu_steps();
-  if (s_dac.fu_id) {
-    dlog("DSPico host: initialising DAC Feature Unit %u — %u controls to set "
+  {
+    const int16_t  q   = s_fu_vol_target;
+    const uint16_t mag = (uint16_t) (q < 0 ? -q : q);
+    dlog("DSPico host: initialising DAC Feature Unit %u — %u controls, vol %s%u.%02u dB "
          "(map: m%c/v%c m%c/v%c m%c/v%c)\n",
            s_dac.fu_id, s_fu_nsteps,
+           q < 0 ? "-" : "", mag / 256, (mag % 256) * 100u / 256u,
            (s_dac.fu_ctrl_nch > 0 && (s_dac.fu_ctrl_sel[0] & 0x03)) ? 'Y' : '-',
            (s_dac.fu_ctrl_nch > 0 && (s_dac.fu_ctrl_sel[0] & 0x0C)) ? 'Y' : '-',
            (s_dac.fu_ctrl_nch > 1 && (s_dac.fu_ctrl_sel[1] & 0x03)) ? 'Y' : '-',
            (s_dac.fu_ctrl_nch > 1 && (s_dac.fu_ctrl_sel[1] & 0x0C)) ? 'Y' : '-',
            (s_dac.fu_ctrl_nch > 2 && (s_dac.fu_ctrl_sel[2] & 0x03)) ? 'Y' : '-',
            (s_dac.fu_ctrl_nch > 2 && (s_dac.fu_ctrl_sel[2] & 0x0C)) ? 'Y' : '-');
-  } else {
-    dlog("DSPico host: no Feature Unit found — skipping volume init\n");
   }
   fu_send_next();
+}
+
+// Ask the DAC for its volume range so the target can be ITS maximum (see the
+// s_fu_vol_target note). UAC2: RANGE request (wNumSubRanges + MIN/MAX/RES
+// triplets); UAC1: GET_MAX. Any failure just leaves the 0 dB default.
+static uint8_t s_fu_range_buf[8];
+
+static void on_get_vol_range_complete(tuh_xfer_t *xfer) {
+  if (stale_completion(xfer)) return;
+  disarm_step_watchdog();
+
+  bool    ok   = false;
+  int16_t vmax = 0;
+  if (xfer->result == XFER_RESULT_SUCCESS) {
+    if (s_dac.audio_bcd >= 0x0200) {
+      const uint16_t nsub = (uint16_t) (s_fu_range_buf[0] | (s_fu_range_buf[1] << 8));
+      if (nsub >= 1 && xfer->actual_len >= 6) {   // wNumSubRanges + bMin + bMax
+        vmax = (int16_t) (s_fu_range_buf[4] | (s_fu_range_buf[5] << 8));
+        ok = true;
+      }
+    } else if (xfer->actual_len >= 2) {
+      vmax = (int16_t) (s_fu_range_buf[0] | (s_fu_range_buf[1] << 8));
+      ok = true;
+    }
+  }
+  if (ok) {
+    if (vmax > FU_VOLUME_CAP_DB256) vmax = FU_VOLUME_CAP_DB256;
+    s_fu_vol_target = vmax;
+    dlog("DSPico host: DAC volume max %s%d/256 dB — targeting it\n",
+           vmax < 0 ? "" : "+", (int) vmax);
+  } else {
+    dlog("DSPico host: DAC volume range unreadable — targeting 0 dB\n");
+  }
+  schedule_step(fu_begin_steps);
+}
+
+static void start_fu_init(void) {
+  s_fu_vol_target = 0;                    // default: 0 dB nominal full output
+  if (s_dac.fu_id == 0) {
+    dlog("DSPico host: no Feature Unit found — skipping volume init\n");
+    fu_send_next();                       // fu_id == 0 -> straight to finish
+    return;
+  }
+
+  // Query the range on the first channel that actually has a volume control
+  // (UAC2 map); with no map (UAC1) use the master channel.
+  uint8_t ch = 0;
+  for (uint8_t c = 0; c < s_dac.fu_ctrl_nch; c++) {
+    if (s_dac.fu_ctrl_sel[c] & 0x0C) { ch = c; break; }
+  }
+
+  const bool uac2 = s_dac.audio_bcd >= 0x0200;
+  tusb_control_request_t const req = {
+      .bmRequestType_bit = { .recipient = TUSB_REQ_RCPT_INTERFACE,
+                             .type = TUSB_REQ_TYPE_CLASS,
+                             .direction = TUSB_DIR_IN },
+      // UAC2 RANGE (0x02) / UAC1 GET_MAX (0x83).
+      .bRequest = uac2 ? AUDIO_CS_REQ_RANGE : 0x83,
+      .wValue = tu_htole16((uint16_t) ((AUDIO_FU_CTRL_VOLUME << 8) | ch)),
+      .wIndex = tu_htole16((uint16_t) ((s_dac.fu_id << 8) | s_dac.ac_itf)),
+      .wLength = tu_htole16(uac2 ? 8 : 2),   // first subrange is enough
+  };
+  tuh_xfer_t xfer = {
+      .daddr = s_dac.dev_addr,
+      .ep_addr = 0,
+      .setup = &req,
+      .buffer = s_fu_range_buf,
+      .complete_cb = on_get_vol_range_complete,
+      .user_data = ++s_chain_gen,
+  };
+  if (tuh_control_xfer(&xfer)) {
+    arm_step_watchdog(fu_begin_steps);    // on timeout: 0 dB default
+  } else {
+    fu_begin_steps();
+  }
 }
 
 // Per-stream packet stats for the heartbeat (reset at every stream start).
@@ -849,30 +951,38 @@ static void send_set_rate_current_clock(void) {
 }
 
 // UAC2: point the Clock Selector at the input pin wired to the clock source
-// that accepted our sample rate. Real hosts always program the selector; a
-// DAC whose selector powers up routed to its ADC/SPDIF clock plays nothing
-// (or noise) until this is done — a plausible cause of "enumerates fine but
-// stays silent" headset codecs. Skipped when the DAC has no selector or no
-// source ACKed the rate (a fixed-clock DAC that STALLs the set is left alone).
-static uint8_t s_sel_buf[1];
+// that accepted our sample rate. Real hosts program the selector; a DAC whose
+// selector powers up routed to its ADC/SPDIF clock plays nothing (or noise)
+// until it is done — a plausible cause of "enumerates fine but stays silent"
+// headset codecs.
+//
+// Deliberately CONSERVATIVE, because an unnecessary write can wedge a quirky
+// codec's EP0 (NAK-forever) and take the whole setup chain down with it:
+//   * skipped entirely for single-input selectors (nothing to route),
+//   * skipped when no clock source ACKed our rate (fixed-clock DACs),
+//   * GET_CUR first — the SET is sent only if the routing actually differs,
+//     and only if the GET succeeded (a selector that can't even answer a
+//     read is not one we blind-write to).
+static uint8_t s_sel_buf[4];
+static uint8_t s_sel_pin;   // desired pin (1-based), resolved before the GET
+static void on_get_selector_complete(tuh_xfer_t *xfer);
 static void on_set_selector_complete(tuh_xfer_t *xfer);
+
 static void send_set_clock_selector(void) {
   uint8_t pin = 0;   // selector pins are 1-based on the wire
   for (uint8_t i = 0; i < s_dac.clock_sel_npins; i++) {
     if (s_dac.clock_sel_pins[i] == s_rate_ok_clock) { pin = (uint8_t) (i + 1); break; }
   }
-  if (pin == 0) {                    // pin list unknown/mismatched — don't guess
+  if (s_dac.clock_sel_npins < 2 || pin == 0) {   // nothing to route / don't guess
     schedule_step(send_get_rate_readback);
     return;
   }
-  dlog("DSPico host: SET clock selector %u -> pin %u (clock source %u)\n",
-         s_dac.clock_sel_id, pin, s_rate_ok_clock);
-  s_sel_buf[0] = pin;
+  s_sel_pin = pin;
 
   tusb_control_request_t const req = {
       .bmRequestType_bit = { .recipient = TUSB_REQ_RCPT_INTERFACE,
                              .type = TUSB_REQ_TYPE_CLASS,
-                             .direction = TUSB_DIR_OUT },
+                             .direction = TUSB_DIR_IN },
       .bRequest = AUDIO_CS_REQ_CUR,
       // UAC2 CX_CLOCK_SELECTOR_CONTROL = 0x01, channel 0.
       .wValue = tu_htole16((uint16_t) (0x01 << 8)),
@@ -884,11 +994,52 @@ static void send_set_clock_selector(void) {
       .ep_addr = 0,
       .setup = &req,
       .buffer = s_sel_buf,
-      .complete_cb = on_set_selector_complete,
+      .complete_cb = on_get_selector_complete,
       .user_data = ++s_chain_gen,
   };
   if (tuh_control_xfer(&xfer)) {
     arm_step_watchdog(send_get_rate_readback);   // on timeout, just continue
+  } else {
+    send_get_rate_readback();
+  }
+}
+
+static void on_get_selector_complete(tuh_xfer_t *xfer) {
+  if (stale_completion(xfer)) return;
+  disarm_step_watchdog();
+  if (xfer->result != XFER_RESULT_SUCCESS) {
+    dlog("DSPico host: clock selector GET failed — leaving routing alone\n");
+    schedule_step(send_get_rate_readback);
+    return;
+  }
+  if (s_sel_buf[0] == s_sel_pin) {
+    dlog("DSPico host: clock selector already on pin %u\n", s_sel_pin);
+    schedule_step(send_get_rate_readback);
+    return;
+  }
+  dlog("DSPico host: SET clock selector %u: pin %u -> %u (clock source %u)\n",
+         s_dac.clock_sel_id, s_sel_buf[0], s_sel_pin, s_rate_ok_clock);
+  s_sel_buf[0] = s_sel_pin;
+
+  tusb_control_request_t const req = {
+      .bmRequestType_bit = { .recipient = TUSB_REQ_RCPT_INTERFACE,
+                             .type = TUSB_REQ_TYPE_CLASS,
+                             .direction = TUSB_DIR_OUT },
+      .bRequest = AUDIO_CS_REQ_CUR,
+      .wValue = tu_htole16((uint16_t) (0x01 << 8)),
+      .wIndex = tu_htole16((uint16_t) ((s_dac.clock_sel_id << 8) | s_dac.ac_itf)),
+      .wLength = tu_htole16(1),
+  };
+  tuh_xfer_t xfer2 = {
+      .daddr = s_dac.dev_addr,
+      .ep_addr = 0,
+      .setup = &req,
+      .buffer = s_sel_buf,
+      .complete_cb = on_set_selector_complete,
+      .user_data = ++s_chain_gen,
+  };
+  if (tuh_control_xfer(&xfer2)) {
+    arm_step_watchdog(send_get_rate_readback);
   } else {
     send_get_rate_readback();
   }
