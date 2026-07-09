@@ -3,8 +3,9 @@
 # DSPico — one-time dependency setup.
 #
 # Fetches the only vendored dependency (Pico-PIO-USB), pins it to a known-good
-# commit, and applies this repo's patches to it (see patches/ — currently the
-# isochronous-OUT host support the audio path needs). Re-running is safe.
+# commit, and applies this repo's patches to it (see patches/ — isochronous
+# OUT host support for the audio path, and isochronous IN support for reading
+# the DAC's rate-feedback endpoint). Re-running is safe.
 #
 # The Pico SDK is located via the PICO_SDK_PATH environment variable; if you
 # don't have it, either install it and export PICO_SDK_PATH, or configure CMake

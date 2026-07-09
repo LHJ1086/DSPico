@@ -34,31 +34,23 @@ void signal_path_on_stream_start(void) {
   __atomic_add_fetch(&s_stream_epoch, 1, __ATOMIC_RELEASE);
 }
 
-// Process a whole number of frames (in a scratch buffer) and push to the ring.
-static void process_and_push(const uint8_t *frames, uint32_t n_frames) {
-  // Work in modest chunks so the scratch buffer stays small.
-  uint8_t scratch[64 * FRAME_BYTES];
-  const uint32_t chunk_frames = sizeof(scratch) / FRAME_BYTES;
+// EQ a whole number of frames IN PLACE in the caller's buffer, then push them
+// to the ring. In-place processing saves a per-packet scratch copy on the hot
+// device-RX path (the caller's buffer is transient by contract, see the
+// header). Only whole frames may enter the ring: a byte-truncated write would
+// shift the producer/consumer frame alignment permanently, so when the ring
+// is (nearly) full whole frames are dropped instead (drop-newest) — and only
+// the frames that will actually be queued are EQ'd.
+static void process_and_push(uint8_t *frames, uint32_t n_frames) {
+  const uint32_t space_frames = audio_ring_free(&s_play) / FRAME_BYTES;
+  if (n_frames > space_frames) n_frames = space_frames;
+  if (n_frames == 0) return;
 
-  while (n_frames) {
-    uint32_t f = n_frames > chunk_frames ? chunk_frames : n_frames;
-
-    // Only whole frames may enter the ring: a byte-truncated write would
-    // shift the producer/consumer frame alignment permanently. When the ring
-    // is (nearly) full, whole frames are dropped instead (drop-newest).
-    const uint32_t space_frames = audio_ring_free(&s_play) / FRAME_BYTES;
-    if (space_frames == 0) return;            // full — drop the rest of this burst
-    if (f > space_frames) f = space_frames;
-
-    memcpy(scratch, frames, f * FRAME_BYTES);
-    peq_process_interleaved_s24(&s_peq, scratch, f);
-    audio_ring_write(&s_play, scratch, f * FRAME_BYTES);
-    frames    += f * FRAME_BYTES;
-    n_frames  -= f;
-  }
+  peq_process_interleaved_s24(&s_peq, frames, n_frames);
+  audio_ring_write(&s_play, frames, n_frames * FRAME_BYTES);
 }
 
-void signal_path_push_capture(const uint8_t *s24, uint32_t bytes) {
+void signal_path_push_capture(uint8_t *s24, uint32_t bytes) {
   // 1) Complete any carried partial frame first.
   if (s_carry_len) {
     uint32_t need = FRAME_BYTES - s_carry_len;

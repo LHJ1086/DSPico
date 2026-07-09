@@ -91,6 +91,8 @@ void peq_init(peq_t *p, float fs) {
   memset(p, 0, sizeof(*p));
   p->fs            = fs;
   p->pre_gain      = 1.0f;
+  p->clip_guard    = 1.0f;
+  p->pre_eff       = 1.0f;
   p->host_gain     = 1.0f;
   p->host_gain_cur = 1.0f;
   // Slew the applied host gain across ~5 ms for a full 0..1 swing, so volume
@@ -116,16 +118,33 @@ void peq_clamp_band(peq_band_t *band) {
   band->q       = clampf(band->q,       PEQ_Q_MIN,       PEQ_Q_MAX);
 }
 
+// Recompute the derived gain facts after any config change: the count of
+// active bands (fast-path check) and the effective pre-gain with the clip
+// guard folded in (see the header note — headroom for the largest band boost
+// is reserved automatically so boosted full-scale audio cannot hard-clip).
+static void update_derived(peq_t *p) {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < PEQ_MAX_BANDS; i++) {
+    if (p->band_active[i]) n++;
+  }
+  p->n_active   = n;
+  // peq_suggested_pre_gain_db() already returns -(largest boost) in dB.
+  p->clip_guard = powf(10.0f, peq_suggested_pre_gain_db(p) / 20.0f);
+  p->pre_eff    = fminf(p->pre_gain, p->clip_guard);
+}
+
 void peq_set_band(peq_t *p, uint8_t idx, const peq_band_t *band) {
   if (idx >= PEQ_MAX_BANDS) return;
   p->band[idx] = *band;
   peq_clamp_band(&p->band[idx]);
   design_band(&p->band[idx], p->fs, &p->coeffs[idx]);
   p->band_active[idx] = p->band[idx].enabled && !band_is_identity(&p->band[idx]);
+  update_derived(p);
 }
 
 void peq_set_pre_gain_db(peq_t *p, float db) {
   p->pre_gain = powf(10.0f, db / 20.0f);
+  update_derived(p);
 }
 
 void peq_set_host_gain(peq_t *p, float linear) {
@@ -142,6 +161,7 @@ void peq_recompute(peq_t *p) {
     design_band(&p->band[i], p->fs, &p->coeffs[i]);
     p->band_active[i] = p->band[i].enabled && !band_is_identity(&p->band[i]);
   }
+  update_derived(p);
 }
 
 void peq_reset_state(peq_t *p) {
@@ -158,10 +178,11 @@ static inline float svf_step(const svf_coeffs_t *c, svf_state_t *s, float v0) {
   return c->m0 * v0 + c->m1 * v1 + c->m2 * v2;
 }
 
-// Run one channel's filter chain (pre-gain -> active bands). Host volume is
-// applied by the frame loops so its slewed value is identical for L and R.
+// Run one channel's filter chain (effective pre-gain -> active bands). Host
+// volume is applied by the frame loops so its slewed value is identical for L
+// and R. pre_eff carries the automatic clip guard (see the header note).
 static inline float process_chain(peq_t *p, uint8_t ch, float x) {
-  x *= p->pre_gain;
+  x *= p->pre_eff;
   for (uint8_t i = 0; i < PEQ_MAX_BANDS; i++) {
     if (p->band_active[i]) {
       x = svf_step(&p->coeffs[i], &p->state[ch][i], x);
@@ -220,6 +241,16 @@ static inline int32_t clamp_s24(float f) {
 }
 
 void peq_process_interleaved_s24(peq_t *p, uint8_t *buf, size_t frames) {
+  // Transparent fast path: flat EQ, unity pre-gain, and a settled unity host
+  // gain means the loop below would round-trip every sample bit-exactly (the
+  // read scale equals the write scale) — skip the float work entirely. This
+  // is the common case whenever the OS volume sits at 0 dB with no EQ set.
+  if (p->n_active == 0 && p->pre_eff == 1.0f &&
+      p->host_gain == 1.0f && p->host_gain_cur == 1.0f) {
+    (void) buf;
+    return;
+  }
+
   for (size_t n = 0; n < frames; n++) {
     uint8_t *fl = buf + (n * 6) + 0;
     uint8_t *fr = buf + (n * 6) + 3;

@@ -39,9 +39,10 @@ static tusb_desc_device_t const desc_device = {
     // Windows caches the MS OS 2.0 / WinUSB binding AND the audio device's
     // format/endpoint properties per VID/PID/bcdDevice. Bump this whenever the
     // descriptor layout changes, or a stale (possibly failed) cached state
-    // sticks forever. Bumped to 0x0103 with the switch to a 16-bit PC-facing
-    // format so the OS re-reads the device fresh.
-    .bcdDevice          = 0x0103,
+    // sticks forever. Bumped to 0x0104 with the volume-default/clip-guard
+    // release so hosts that cached the earlier (possibly failed) state
+    // re-read the device fresh.
+    .bcdDevice          = 0x0104,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x03,

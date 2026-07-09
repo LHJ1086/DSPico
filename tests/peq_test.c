@@ -50,6 +50,8 @@ static void one_band(peq_t *p, peq_type_t t, float fc, float gain, float q) {
 // Drive band 0 of `p` with a unit sine at `f` Hz and return the steady-state
 // magnitude response in dB (RMS out / RMS in over a settled window). The band's
 // Q sizes the settling window, since resonance decays like ~Q*fs/(pi*f) samples.
+// The engine's automatic clip guard scales the whole chain by pre_eff; divide
+// it back out so this measures the BAND's response, not the guard.
 static float measure_gain_db(peq_t *p, float f) {
   const double tau    = (double) p->band[0].q * FS / (M_PI * (double) f);
   const long   settle = (long) (8.0 * tau) + 20000;
@@ -63,7 +65,7 @@ static float measure_gain_db(peq_t *p, float f) {
     peq_process_stereo_f32(p, &l, &r, 1);
     if (n >= settle) { sum_out += (double) l * l; sum_in += (double) x * x; }
   }
-  return 20.0f * log10f((float) sqrt(sum_out / sum_in));
+  return 20.0f * log10f((float) sqrt(sum_out / sum_in) / p->pre_eff);
 }
 
 static void test_flat_transparent(void) {
@@ -229,6 +231,54 @@ static void test_suggested_pregain(void) {
   check_close(peq_suggested_pre_gain_db(&p), 0.0f, 0.0f, "only cuts -> 0 dB");
 }
 
+static void test_clip_guard(void) {
+  printf("clip guard reserves headroom for band boosts (no hard clipping):\n");
+  peq_t p; peq_init(&p, FS);
+  check_close(p.pre_eff, 1.0f, 0.0f, "flat EQ applies unity effective pre-gain");
+
+  peq_band_t boost = { .enabled = true, .type = PEQ_PEAKING,
+                       .fc = 1000.0f, .gain_db = 6.0f, .q = 1.0f };
+  peq_set_band(&p, 0, &boost);
+  check_close(p.pre_eff, powf(10.0f, -6.0f / 20.0f), 1e-6f,
+              "+6 dB boost -> -6 dB effective pre-gain");
+
+  // A user pre-gain below the guard is honoured as-is...
+  peq_set_pre_gain_db(&p, -9.0f);
+  check_close(p.pre_eff, powf(10.0f, -9.0f / 20.0f), 1e-6f,
+              "user -9 dB (below the guard) is applied unchanged");
+  // ...one above it is capped at the guard.
+  peq_set_pre_gain_db(&p, 0.0f);
+  check_close(p.pre_eff, powf(10.0f, -6.0f / 20.0f), 1e-6f,
+              "user 0 dB is capped at the -6 dB guard");
+
+  // Cut-only EQ: no headroom reserved, user pre-gain passes through.
+  peq_t cut; peq_init(&cut, FS);
+  peq_band_t dip = { .enabled = true, .type = PEQ_PEAKING,
+                     .fc = 1000.0f, .gain_db = -6.0f, .q = 1.0f };
+  peq_set_band(&cut, 0, &dip);
+  check_close(cut.pre_eff, 1.0f, 0.0f, "cut-only EQ keeps unity pre-gain");
+
+  // A near-full-scale sine at the boosted centre frequency must come out of
+  // the 24-bit path without ever touching the rails (the un-guarded engine
+  // hard-clipped every cycle here).
+  peq_reset_state(&p);
+  long railed = 0;
+  for (int n = 0; n < 48000; n++) {
+    float x = 0.9f * sinf(2.0f * (float) M_PI * 1000.0f * (float) n / FS);
+    int32_t s = (int32_t) lrintf(x * 8388608.0f);
+    if (s > 8388607) s = 8388607;
+    uint8_t buf[6] = {
+      (uint8_t) (s & 0xFF), (uint8_t) ((s >> 8) & 0xFF), (uint8_t) ((s >> 16) & 0xFF),
+      (uint8_t) (s & 0xFF), (uint8_t) ((s >> 8) & 0xFF), (uint8_t) ((s >> 16) & 0xFF),
+    };
+    peq_process_interleaved_s24(&p, buf, 1);
+    int32_t o = (int32_t) (buf[0] | (buf[1] << 8) | (buf[2] << 16));
+    if (o & 0x800000) o |= (int32_t) 0xFF000000;
+    if (o >= 8388607 || o <= -8388608) railed++;
+  }
+  check(railed == 0, "boosted full-scale sine never hits the 24-bit rails");
+}
+
 static void test_peaking_center_gain(void) {
   printf("peaking gain lands on target at the centre frequency:\n");
   peq_t p;
@@ -300,6 +350,7 @@ int main(void) {
   test_identity_band_skipped();
   test_clamp();
   test_suggested_pregain();
+  test_clip_guard();
   test_peaking_center_gain();
   test_peaking_flat_away();
   test_low_high_freq_exact();

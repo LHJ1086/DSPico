@@ -1,0 +1,60 @@
+Isochronous IN support (applied on top of 0001).
+
+A UAC asynchronous DAC reports its true consumption rate on an explicit
+feedback (isochronous IN) endpoint. The stock host code treats every IN like
+bulk/interrupt: it ACKs the data and toggles DATA0/1. Isochronous has neither
+a handshake phase nor a data toggle (USB 2.0 secs 5.6, 8.5.5), so the ACK is a
+protocol violation and the toggle makes every second read "mismatch" —
+feedback could never be read. This teaches usb_in_transaction() the iso rules:
+expect DATA0 always, send no handshake (handshake == 0 in the bus helper),
+and keep data_id pinned to 0.
+
+--- a/src/pio_usb.c
++++ b/src/pio_usb.c
+@@ -245,6 +245,12 @@
+           pio_usb_bus_usb_transfer(pp, ack_encoded, 5);
+           return idx - 4;
+         }
++      } else if (handshake == 0) {
++        // Isochronous: no handshake phase (USB 2.0 sec 8.5.5) — accept the
++        // payload on a good CRC and put nothing on the bus.
++        if (idx >= 4 && crc_match) {
++          return idx - 4;
++        }
+       } else if (handshake == USB_PID_NAK) {
+         pio_usb_bus_usb_transfer(pp, nak_encoded, 5);
+       } else {
+--- a/src/pio_usb_host.c
++++ b/src/pio_usb_host.c
+@@ -537,19 +537,29 @@
+ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
+                                                              endpoint_t *ep) {
+   int res = 0;
+-  uint8_t expect_pid = (ep->data_id == 1) ? USB_PID_DATA1 : USB_PID_DATA0;
++  // Isochronous IN has no handshake and no data toggle: a full-speed device
++  // always answers with DATA0 (USB 2.0 sec 5.6/8.5.5). Expect DATA0, send no
++  // ACK, and undo the toggle done by pio_usb_ll_transfer_continue(). Needed
++  // to read a UAC asynchronous feedback endpoint through this host.
++  bool const is_iso = ((ep->attr & 0x03) == EP_ATTR_ISOCHRONOUS);
++  uint8_t expect_pid =
++      (!is_iso && ep->data_id == 1) ? USB_PID_DATA1 : USB_PID_DATA0;
+ 
+   pio_usb_bus_prepare_receive(pp);
+   pio_usb_bus_send_token(pp, USB_PID_IN, ep->dev_addr, ep->ep_num);
+   pio_usb_bus_start_receive(pp);
+ 
+-  int receive_len = pio_usb_bus_receive_packet_and_handshake(pp, USB_PID_ACK);
++  int receive_len =
++      pio_usb_bus_receive_packet_and_handshake(pp, is_iso ? 0 : USB_PID_ACK);
+   uint8_t const receive_pid = pp->usb_rx_buffer[1];
+ 
+   if (receive_len >= 0) {
+     if (receive_pid == expect_pid) {
+       memcpy(ep->app_buf, &pp->usb_rx_buffer[2], receive_len);
+       pio_usb_ll_transfer_continue(ep, receive_len);
++      if (is_iso) {
++        ep->data_id = 0;
++      }
+     } else {
+       // DATA0/1 mismatched, 0 for re-try next frame
+     }

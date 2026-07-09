@@ -42,13 +42,17 @@ static inline uint32_t audio_ring_free(const audio_ring_t *r) {
 }
 
 // Producer: push up to `len` bytes; returns bytes actually written.
+// Copies in at most two memcpy segments (up to the wrap, then the remainder)
+// instead of a byte loop — this runs per audio packet on both hot paths.
 static inline uint32_t audio_ring_write(audio_ring_t *r, const uint8_t *src, uint32_t len) {
   uint32_t space = audio_ring_free(r);
   if (len > space) len = space;
-  uint32_t head = r->head;
-  for (uint32_t i = 0; i < len; i++) {
-    r->buf[(head + i) & (AUDIO_RING_CAP - 1)] = src[i];
-  }
+  const uint32_t head = r->head;
+  const uint32_t at   = head & (AUDIO_RING_CAP - 1);
+  uint32_t first = AUDIO_RING_CAP - at;
+  if (first > len) first = len;
+  memcpy(&r->buf[at], src, first);
+  memcpy(&r->buf[0], src + first, len - first);
   __atomic_store_n(&r->head, head + len, __ATOMIC_RELEASE);
   return len;
 }
@@ -57,10 +61,12 @@ static inline uint32_t audio_ring_write(audio_ring_t *r, const uint8_t *src, uin
 static inline uint32_t audio_ring_read(audio_ring_t *r, uint8_t *dst, uint32_t len) {
   uint32_t avail = audio_ring_used(r);
   if (len > avail) len = avail;
-  uint32_t tail = r->tail;
-  for (uint32_t i = 0; i < len; i++) {
-    dst[i] = r->buf[(tail + i) & (AUDIO_RING_CAP - 1)];
-  }
+  const uint32_t tail = r->tail;
+  const uint32_t at   = tail & (AUDIO_RING_CAP - 1);
+  uint32_t first = AUDIO_RING_CAP - at;
+  if (first > len) first = len;
+  memcpy(dst, &r->buf[at], first);
+  memcpy(dst + first, &r->buf[0], len - first);
   __atomic_store_n(&r->tail, tail + len, __ATOMIC_RELEASE);
   return len;
 }

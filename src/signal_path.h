@@ -30,9 +30,10 @@
 void signal_path_init(void);
 
 // --- Producer side (device RX, core0) --------------------------------------
-// Feed received 24-bit interleaved stereo audio. It is EQ'd in place and pushed
-// to the play ring. `bytes` need not be frame-aligned; a remainder is carried.
-void signal_path_push_capture(const uint8_t *s24, uint32_t bytes);
+// Feed received 24-bit interleaved stereo audio. It is EQ'd IN PLACE (the
+// caller's buffer is clobbered — treat it as transient) and pushed to the
+// play ring. `bytes` need not be frame-aligned; a remainder is carried.
+void signal_path_push_capture(uint8_t *s24, uint32_t bytes);
 
 // Called when the PC (re)starts/stops streaming, to reset filter history.
 void signal_path_on_stream_start(void);

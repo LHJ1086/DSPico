@@ -6,8 +6,8 @@
 //   1. claims a class-compliant audio device on the PIO host port,
 //   2. sets its clock to 48 kHz and selects the operational alt setting,
 //   3. opens the isochronous OUT endpoint, and
-//   4. continuously streams whatever the fill callback provides (a test tone
-//      in Phase 1b; the play ring in Phase 2+).
+//   4. continuously streams whatever the fill callback provides (the play
+//      ring), sending silent packets whenever the callback has nothing.
 //
 // Whether iso-OUT streams cleanly over the bit-banged PIO port is THE open
 // question the whole project hinges on — expect to iterate here on hardware

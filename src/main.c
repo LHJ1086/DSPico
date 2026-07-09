@@ -6,9 +6,9 @@
 //   * core0: native USB DEVICE (UAC2 speaker) + app/DSP
 //
 // The full bridge is wired: the device side enumerates as a UAC2 output, and
-// PC audio is EQ'd and streamed on to the downstream DAC (audio_source below).
-// A firmware-generated test tone feeds the DAC whenever no PC is streaming, so
-// the DAC stays fed for bring-up with nothing attached upstream.
+// PC audio is EQ'd and streamed on to the downstream DAC. When no PC audio is
+// queued (idle, priming, or a momentary underrun) the host side sends silent
+// packets, which keeps the DAC clocked without ever sounding on its own.
 // ---------------------------------------------------------------------------
 #include <stdio.h>
 #include <string.h>
@@ -27,7 +27,6 @@
 #include "uac2_device.h"
 #include "uac_host.h"
 #include "usb_descriptors.h"
-#include "test_tone.h"
 #include "signal_path.h"
 #include "config_usb.h"
 
@@ -43,29 +42,11 @@ static void fpu_enable_flush_to_zero(void) {
   __asm volatile ("vmsr fpscr, %0" : : "r" (fpscr));
 }
 
-// The audio the host streams to the DAC: EQ'd PC audio from the play ring when
-// the PC is streaming, otherwise the firmware test tone (keeps the DAC fed and
-// lets the Phase 1b gate run with no PC attached). While the PC *is* streaming
-// but the ring is priming or momentarily underrun, fill with silence — a gap
-// must not blast the test tone into the music.
-static size_t audio_source(uint8_t *dst, size_t max_frames) {
-  size_t frames = signal_path_pull_play(dst, max_frames);
-  if (frames == 0) {
-    if (uac2_is_streaming()) {
-      memset(dst, 0, max_frames * DSPICO_NUM_CHANNELS * DSPICO_BYTES_PER_SAMPLE);
-      frames = max_frames;
-    } else {
-      frames = test_tone_fill(dst, max_frames);   // returns frames
-    }
-  }
-  return frames;
-}
-
 // ---------------------------------------------------------------------------
 // core1 — PIO-USB host
 // ---------------------------------------------------------------------------
 static void core1_main(void) {
-  fpu_enable_flush_to_zero();   // core1 runs float too (test tone sinf)
+  fpu_enable_flush_to_zero();   // in case core1 code ever touches float
 
   // The PIO-USB host is configured AND serviced on the core that owns its
   // timing. Configure the data pins for this board's variant (board_config.h).
@@ -137,9 +118,9 @@ int main(void) {
   //                     .fc = 1000.0f, .gain_db = -6.0f, .q = 1.0f };
   // signal_path_set_band(0, &demo);
 
-  // Idle/gate fallback tone, and the DAC audio source.
-  test_tone_config(1000.0f, -6.0f);
-  uac_host_set_source(audio_source);
+  // The DAC audio source: EQ'd PC audio from the play ring. When it returns
+  // no frames (idle / priming / underrun) the host side sends silence.
+  uac_host_set_source(signal_path_pull_play);
 
   // Launch the PIO-USB host on core1.
   multicore_reset_core1();

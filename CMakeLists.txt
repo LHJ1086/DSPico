@@ -33,7 +33,6 @@ add_executable(dspico
     src/usb_descriptors.c
     src/uac2_device.c
     src/uac_host.c
-    src/test_tone.c
     src/status_led.c
     src/dsp_peq.c
     src/signal_path.c

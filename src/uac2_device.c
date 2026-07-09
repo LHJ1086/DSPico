@@ -36,8 +36,11 @@ void tud_resume_cb(void)  { dlog0("DSPico device: resumed\n"); }
 #define VOL_MAX_DB_256   (0 * 256)
 #define VOL_RES_DB_256   (256)          // 1 dB steps
 
-// Index 0 = master, 1 = front-left, 2 = front-right.
-static int16_t s_volume_db256[DSPICO_NUM_CHANNELS + 1] = { -6 * 256, 0, 0 };
+// Index 0 = master, 1 = front-left, 2 = front-right. Master boots at 0 dB —
+// full output — so the bridge's maximum loudness matches a plain USB DAC; the
+// PEQ engine's automatic clip guard (dsp_peq.h) now owns the headroom needed
+// for EQ boosts, so no fixed attenuation has to be baked in here.
+static int16_t s_volume_db256[DSPICO_NUM_CHANNELS + 1] = { 0, 0, 0 };
 static int8_t  s_mute[DSPICO_NUM_CHANNELS + 1] = { 0, 0, 0 };
 
 // Written on core0 (USB callbacks), read on core1 (the DAC fill path) — use
@@ -287,7 +290,7 @@ bool tud_audio_set_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p
   // Some hosts issue SET_CUR(sample freq) on the Clock Source during stream
   // startup even though we advertise the frequency control read-only. STALLing
   // it can make the host abort before it ever opens the AS interface (so the
-  // stream never starts and only the fall-back test tone is heard). Accept it
+  // stream never starts and the bridge stays silent). Accept it
   // as a no-op — our single supported rate is the only one RANGE allows anyway.
   if (entity_id == UAC2_ENTITY_CLOCK) {
     if (ctrl_sel == AUDIO_CS_CTRL_SAM_FREQ && p_request->bRequest == AUDIO_CS_REQ_CUR) {

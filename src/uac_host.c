@@ -45,6 +45,8 @@ typedef struct {
   uint8_t  clock_ids[4];    // every UAC2 Clock Source entity seen
   uint8_t  clock_count;
   uint8_t  clock_sel_id;    // UAC2 Clock Selector entity (0 if none)
+  uint8_t  clock_sel_pins[4];   // baCSourceID of each selector input pin
+  uint8_t  clock_sel_npins;
 
   // Feature Unit discovery, to unmute/set volume on the DAC's playback path
   // (real hosts always do this; DACs may power up muted or at minimum volume).
@@ -99,6 +101,9 @@ static uint16_t s_desc_pos;   // dump cursor (== s_desc_len when finished)
 
 // One outstanding iso packet at a time; DMA-aligned.
 CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN static uint8_t s_pkt[UAC_HOST_PKT_MAX];
+
+// Stall watchdog: last iso OUT completion (see uac_host_task / finish_setup).
+static uint32_t s_last_iso_ms;
 
 void uac_host_set_source(uac_host_fill_cb_t cb) { s_fill_cb = cb; }
 bool uac_host_is_streaming(void) { return s_dac.in_use && s_dac.streaming; }
@@ -278,8 +283,18 @@ static void parse_audio_function(dac_dev_t *d, uint8_t const *p, uint16_t len) {
       } else if (subtype == AUDIO_CS_AC_INTERFACE_CLOCK_SOURCE && dlen >= 4) {
         if (d->clock_count < TU_ARRAY_SIZE(d->clock_ids))
           d->clock_ids[d->clock_count++] = p[3];      // bClockID
-      } else if (subtype == AUDIO_CS_AC_INTERFACE_CLOCK_SELECTOR && dlen >= 4) {
+      } else if (subtype == AUDIO_CS_AC_INTERFACE_CLOCK_SELECTOR && dlen >= 5) {
         d->clock_sel_id = p[3];                        // bClockID of the selector
+        // Record the selector's input pins (baCSourceID list) so the setup
+        // chain can select the pin wired to the clock source that accepted
+        // our sample rate — DACs whose selector powers up on the ADC/SPDIF
+        // clock stay silent until a host does this.
+        d->clock_sel_npins = 0;
+        const uint8_t npins = p[4];
+        for (uint8_t i = 0; i < npins && i < TU_ARRAY_SIZE(d->clock_sel_pins)
+                            && (uint16_t) (5 + i) < dlen; i++) {
+          d->clock_sel_pins[d->clock_sel_npins++] = p[5 + i];
+        }
       } else if (subtype == AUDIO_CS_AC_INTERFACE_FEATURE_UNIT && dlen >= 5) {
         if (d->fu_count < TU_ARRAY_SIZE(d->fu_ids)) {
           const uint8_t idx = d->fu_count++;
@@ -393,6 +408,7 @@ static bool dac_open(uint8_t rhport, uint8_t dev_addr,
 //   UAC1: SET_INTERFACE(alt) first, then the endpoint SAMPLING_FREQ control
 //         — the endpoint only exists once the alt is active.
 static void submit_first_packet(void);
+static void submit_packet(void);
 static void on_set_alt_complete(tuh_xfer_t *xfer);
 static void on_set_freq_complete(tuh_xfer_t *xfer);
 
@@ -466,6 +482,18 @@ void uac_host_task(void) {
     fn();
   }
 
+  // Stream-stall watchdog: the packet pump is a completion-driven loop
+  // (on_iso_complete -> submit_packet). If a completion is ever lost — a
+  // transient bus error, an abort race — the loop dies and the DAC goes
+  // silent until replug. Restart the pump if no packet completed recently;
+  // a resubmit while one IS pending is refused harmlessly (EP busy).
+  if (s_dac.in_use && s_dac.streaming &&
+      (int32_t) (now - s_last_iso_ms) > 100) {
+    s_last_iso_ms = now;
+    dlog("DSPico host: iso OUT pump stalled — restarting\n");
+    submit_packet();
+  }
+
   if (s_step_deadline_ms == 0 || !s_dac.in_use) return;
   if ((int32_t) (now - s_step_deadline_ms) < 0) return;
   s_step_deadline_ms = 0;
@@ -492,9 +520,18 @@ static void timeout_alt(void) {
 }
 static void send_set_sample_rate_uac1(void);
 static void send_set_rate_current_clock(void);   // UAC2: one clock source
+static void send_set_clock_selector(void);        // UAC2: route the good clock
 static void send_get_rate_readback(void);         // UAC2: verify + log
 static uint8_t s_rate_tries;
-static uint8_t s_clock_idx;   // which UAC2 clock source we're programming
+static uint8_t s_clock_idx;      // which UAC2 clock source we're programming
+static uint8_t s_rate_ok_clock;  // first clock source that ACKed our rate (0 = none)
+
+// All clock sources have been attempted: route the selector (if the DAC has
+// one and a source accepted our rate), else go straight to the readback.
+static void after_clocks_done(void) {
+  if (s_dac.clock_sel_id && s_rate_ok_clock) schedule_step(send_set_clock_selector);
+  else                                       schedule_step(send_get_rate_readback);
+}
 
 static void timeout_rate(void) {
   // A NAK-forever rate request may still succeed on a retry once the DAC has
@@ -507,10 +544,10 @@ static void timeout_rate(void) {
     return;
   }
   if (setup_is_uac2()) {
-    // Give up on this clock source; try the next, else read back + continue.
+    // Give up on this clock source; try the next, else selector/readback.
     s_rate_tries = 0;
     if (++s_clock_idx < s_dac.clock_count) schedule_step(send_set_rate_current_clock);
-    else                                   schedule_step(send_get_rate_readback);
+    else                                   after_clocks_done();
   } else {
     start_fu_init();
   }
@@ -537,11 +574,13 @@ static bool setup_is_uac2(void) {
 // streamed silently. The step list is now built from the parsed control map.
 static void finish_setup(void);
 
-// Volume target: a modest -12 dB (1/256 dB units) rather than 0 dB — audible
-// on every DAC, but doesn't slam a bus-powered amp to full output the moment
-// it unmutes (marginal VBUS + full amp draw can brown the dongle out into an
-// attach/detach loop). The OS volume on the PC side still scales the stream.
-#define FU_VOLUME_TARGET ((uint16_t)(int16_t)(-12 * 256))
+// Volume target: 0 dB (1/256 dB units) — the DAC's nominal full output, which
+// is what every real host sets after enumeration. Anything less permanently
+// caps the bridge's maximum loudness and eats the headroom users need to hear
+// EQ differences (the earlier -12 dB did exactly that). The OS volume on the
+// PC side still scales the stream, and the PEQ clip guard owns EQ headroom.
+// If a marginal bus-powered amp browns out at full output, lower this.
+#define FU_VOLUME_TARGET ((uint16_t)(int16_t)(0 * 256))
 
 // The step list, built by build_fu_steps() from the resolved FU's control map.
 // Room for master + stereo, each with a mute and a volume control.
@@ -581,7 +620,7 @@ static void on_fu_step_complete(tuh_xfer_t *xfer) {
   disarm_step_watchdog();
   const uint8_t i = s_fu_step - 1;
   dlog("DSPico host: FU %u %s ch%u -> %s\n", s_dac.fu_id,
-         s_fu_steps[i].sel == AUDIO_FU_CTRL_MUTE ? "unmute" : "vol -12dB",
+         s_fu_steps[i].sel == AUDIO_FU_CTRL_MUTE ? "unmute" : "vol 0dB",
          s_fu_steps[i].ch,
          xfer->result == XFER_RESULT_SUCCESS ? "OK" : "stalled (not implemented)");
   schedule_step(fu_send_next);   // pace control requests (dongle quirk)
@@ -645,16 +684,94 @@ static void start_fu_init(void) {
 static uint32_t s_iso_pkts;
 static uint32_t s_stream_t0_ms;
 
+// --- DAC clock-drift adaptation (async DACs with a feedback EP) --------------
+// An asynchronous DAC runs on its own crystal; blindly sending a fixed 48
+// frames every millisecond lets the DAC's internal FIFO drift until it over-
+// or underruns — an audible periodic click/crackle on long playback. The DAC
+// reports the rate it actually wants on its explicit feedback (iso IN)
+// endpoint; we read it and vary the packet size (47/48/49 frames) to match.
+// Everything degrades gracefully: no feedback EP, a failed open, bogus
+// values, or a dead endpoint all fall back to the fixed 48 frames/packet.
+static uint32_t s_fb_rate_q14;   // smoothed samples/frame from the DAC (Q10.14); 0 = fixed 48
+static uint32_t s_fb_acc_q14;    // fractional-frame accumulator (packet sizing)
+static uint16_t s_fb_errors;     // consecutive failed feedback reads
+static bool     s_fb_polling;    // feedback EP open + reads being submitted
+CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN static uint8_t s_fb_buf[4];
+
+static void on_fb_complete(tuh_xfer_t *xfer);
+
+static void submit_fb_read(void) {
+  if (!s_dac.streaming || !s_fb_polling) return;
+  tuh_xfer_t xfer = {
+      .daddr = s_dac.dev_addr,
+      .ep_addr = s_dac.ep_fb.bEndpointAddress,
+      .buflen = sizeof(s_fb_buf),
+      .buffer = s_fb_buf,
+      .complete_cb = on_fb_complete,
+      .user_data = 0,
+  };
+  if (!tuh_edpt_xfer(&xfer)) {
+    s_fb_polling = false;   // submit refused — stop polling, keep fixed rate
+  }
+}
+
+static void on_fb_complete(tuh_xfer_t *xfer) {
+  if (!s_dac.in_use || xfer->daddr != s_dac.dev_addr) return;
+
+  if (xfer->result == XFER_RESULT_SUCCESS && xfer->actual_len >= 3) {
+    // Full-speed feedback is 3 bytes in 10.14 format; some devices send
+    // 4 bytes in 16.16 (high-speed layout) — normalise both to Q14.
+    uint32_t v = (uint32_t) (s_fb_buf[0] | (s_fb_buf[1] << 8) | (s_fb_buf[2] << 16));
+    if (xfer->actual_len >= 4) v = (v | ((uint32_t) s_fb_buf[3] << 24)) >> 2;
+
+    // Sanity: a real 48 kHz DAC asks for 48 +/- (crystal tolerance) samples
+    // per frame. Accept only 47..49 — anything else is a malformed read.
+    if (v >= (47u << 14) && v <= (49u << 14)) {
+      s_fb_errors = 0;
+      // Light smoothing; the DAC already averages its own measurement.
+      const uint32_t cur = s_fb_rate_q14 ? s_fb_rate_q14
+                                         : ((uint32_t) DSPICO_SAMPLES_PER_MS << 14);
+      s_fb_rate_q14 = cur + (uint32_t) ((((int32_t) v - (int32_t) cur)) / 8);
+    }
+  } else if (++s_fb_errors > 200) {
+    // ~a second of continuous failures: the endpoint isn't really talking.
+    dlog("DSPico host: DAC feedback EP unresponsive — fixed 48 frames/packet\n");
+    s_fb_polling  = false;
+    s_fb_rate_q14 = 0;
+    return;
+  }
+  submit_fb_read();
+}
+
 // Final step for both protocols: open the iso OUT endpoint and start pumping.
 static void finish_setup(void) {
   disarm_step_watchdog();
   if (tuh_edpt_open(s_dac.dev_addr, &s_dac.ep_out)) {
     s_iso_pkts = 0;
     s_stream_t0_ms = to_ms_since_boot(get_absolute_time());
+    s_last_iso_ms  = s_stream_t0_ms;
     s_dac.streaming = true;
     dlog("DSPico host: streaming started (EP 0x%02X, %u-byte subslot)\n",
            s_dac.ep_out.bEndpointAddress, s_dac.subslot);
+
+    // Async DAC with an explicit feedback endpoint: open it and start the
+    // read loop that drives the packet-size adaptation above.
+    s_fb_rate_q14 = 0;
+    s_fb_acc_q14  = 0;
+    s_fb_errors   = 0;
+    s_fb_polling  = false;
+    if (s_dac.ep_async && s_dac.have_fb) {
+      if (tuh_edpt_open(s_dac.dev_addr, &s_dac.ep_fb)) {
+        s_fb_polling = true;
+        dlog("DSPico host: DAC feedback EP 0x%02X open — rate adaptation on\n",
+               s_dac.ep_fb.bEndpointAddress);
+      } else {
+        dlog("DSPico host: feedback EP open failed — fixed 48 frames/packet\n");
+      }
+    }
+
     submit_first_packet();
+    if (s_fb_polling) submit_fb_read();
   } else {
     s_dac.incompatible = true;
     dlog("DSPico host: ERROR — tuh_edpt_open(0x%02X) failed\n",
@@ -729,6 +846,61 @@ static void send_set_rate_current_clock(void) {
     dlog("DSPico host: set-rate submit failed\n");
     timeout_rate();
   }
+}
+
+// UAC2: point the Clock Selector at the input pin wired to the clock source
+// that accepted our sample rate. Real hosts always program the selector; a
+// DAC whose selector powers up routed to its ADC/SPDIF clock plays nothing
+// (or noise) until this is done — a plausible cause of "enumerates fine but
+// stays silent" headset codecs. Skipped when the DAC has no selector or no
+// source ACKed the rate (a fixed-clock DAC that STALLs the set is left alone).
+static uint8_t s_sel_buf[1];
+static void on_set_selector_complete(tuh_xfer_t *xfer);
+static void send_set_clock_selector(void) {
+  uint8_t pin = 0;   // selector pins are 1-based on the wire
+  for (uint8_t i = 0; i < s_dac.clock_sel_npins; i++) {
+    if (s_dac.clock_sel_pins[i] == s_rate_ok_clock) { pin = (uint8_t) (i + 1); break; }
+  }
+  if (pin == 0) {                    // pin list unknown/mismatched — don't guess
+    schedule_step(send_get_rate_readback);
+    return;
+  }
+  dlog("DSPico host: SET clock selector %u -> pin %u (clock source %u)\n",
+         s_dac.clock_sel_id, pin, s_rate_ok_clock);
+  s_sel_buf[0] = pin;
+
+  tusb_control_request_t const req = {
+      .bmRequestType_bit = { .recipient = TUSB_REQ_RCPT_INTERFACE,
+                             .type = TUSB_REQ_TYPE_CLASS,
+                             .direction = TUSB_DIR_OUT },
+      .bRequest = AUDIO_CS_REQ_CUR,
+      // UAC2 CX_CLOCK_SELECTOR_CONTROL = 0x01, channel 0.
+      .wValue = tu_htole16((uint16_t) (0x01 << 8)),
+      .wIndex = tu_htole16((uint16_t) ((s_dac.clock_sel_id << 8) | s_dac.ac_itf)),
+      .wLength = tu_htole16(1),
+  };
+  tuh_xfer_t xfer = {
+      .daddr = s_dac.dev_addr,
+      .ep_addr = 0,
+      .setup = &req,
+      .buffer = s_sel_buf,
+      .complete_cb = on_set_selector_complete,
+      .user_data = ++s_chain_gen,
+  };
+  if (tuh_control_xfer(&xfer)) {
+    arm_step_watchdog(send_get_rate_readback);   // on timeout, just continue
+  } else {
+    send_get_rate_readback();
+  }
+}
+
+static void on_set_selector_complete(tuh_xfer_t *xfer) {
+  if (stale_completion(xfer)) return;
+  disarm_step_watchdog();
+  dlog("DSPico host: clock selector -> %s\n",
+         xfer->result == XFER_RESULT_SUCCESS ? "OK"
+                                             : "stalled (fixed routing, fine)");
+  schedule_step(send_get_rate_readback);
 }
 
 // UAC2: GET_CUR the sample frequency back from the first clock source so the log
@@ -833,8 +1005,8 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
     dlog("DSPico host: clock topology — %u sources, selector id %u\n",
            s_dac.clock_count, s_dac.clock_sel_id);
   if (s_dac.ep_async && s_dac.have_fb)
-    dlog("DSPico host: DAC async feedback EP 0x%02X present (host sends fixed 48/frame; "
-         "drift tolerated by DAC buffering)\n", s_dac.ep_fb.bEndpointAddress);
+    dlog("DSPico host: DAC async feedback EP 0x%02X present — will adapt packet size\n",
+           s_dac.ep_fb.bEndpointAddress);
 
   // Resolve the playback Feature Unit for the volume-init step: prefer the
   // unit that feeds the speaker/headphone Output Terminal, else the first.
@@ -854,8 +1026,9 @@ static bool dac_set_config(uint8_t dev_addr, uint8_t itf_num) {
   }
 
   // Kick the setup chain (see the ordering note above).
-  s_rate_tries = 0;
-  s_clock_idx  = 0;
+  s_rate_tries    = 0;
+  s_clock_idx     = 0;
+  s_rate_ok_clock = 0;
   if (setup_is_uac2()) {
     send_set_rate_current_clock(); // rate on every clock source, then alt
   } else {
@@ -890,11 +1063,16 @@ static void on_set_freq_complete(tuh_xfer_t *xfer) {
   dlog("DSPico host: SET sample rate 48000 -> %s\n",
          xfer->result == XFER_RESULT_SUCCESS ? "OK" : "stalled/failed (continuing)");
   if (setup_is_uac2()) {
+    // Remember the first source that took the rate — the selector step (and
+    // by extension the DAC's playback path) is routed to it.
+    if (xfer->result == XFER_RESULT_SUCCESS && s_rate_ok_clock == 0) {
+      s_rate_ok_clock = s_dac.clock_ids[s_clock_idx];
+    }
     s_rate_tries = 0;
     if (++s_clock_idx < s_dac.clock_count) {
       schedule_step(send_set_rate_current_clock);   // program the next clock source
     } else {
-      schedule_step(send_get_rate_readback);        // all sources done — verify + log
+      after_clocks_done();                          // selector, then verify + log
     }
   } else {
     schedule_step(start_fu_init);  // UAC1: alt+rate done — unmute, then stream
@@ -906,9 +1084,21 @@ static uint16_t build_packet(void) {
   const uint8_t  wire_bps = s_dac.subslot;                       // 2, 3 or 4
   const uint16_t wire_bpf = DSPICO_NUM_CHANNELS * wire_bps;      // bytes/frame on the wire
 
+  // Frames for THIS packet: nominally 48/ms; with feedback active, a Q14
+  // fractional accumulator turns the DAC's requested rate into a 47/48/49
+  // pattern whose average matches the DAC's clock exactly.
   size_t frames = DSPICO_SAMPLES_PER_MS;
+  if (s_fb_rate_q14) {
+    const uint32_t acc = s_fb_acc_q14 + s_fb_rate_q14;
+    frames       = acc >> 14;
+    s_fb_acc_q14 = acc & 0x3FFF;
+  }
+  if (frames > DSPICO_SAMPLES_PER_MS + 1) frames = DSPICO_SAMPLES_PER_MS + 1;   // s_pkt limit
   const size_t max_frames = s_dac.ep_out.wMaxPacketSize / wire_bpf;
-  if (frames > max_frames) frames = max_frames;
+  if (frames > max_frames) {
+    frames = max_frames;
+    s_fb_acc_q14 = 0;   // anti-windup: don't bank frames the alt can't carry
+  }
 
   // The source always produces the native 24-bit/3-byte format (6 B/frame).
   size_t got = 0;
@@ -921,11 +1111,18 @@ static uint16_t build_packet(void) {
 
   const size_t samples = got * DSPICO_NUM_CHANNELS;
   if (wire_bps == 2) {
-    // 16-bit alt: truncate each 24-bit LE sample to its top 16 bits. Forward
-    // in place is safe — the 2-byte destination always trails the 3-byte source.
+    // 16-bit alt: round-to-nearest (with saturation) instead of truncating —
+    // rounding halves the requantisation error, which matters once the EQ has
+    // produced samples that use the full 24-bit grid. Forward in place is
+    // safe — each sample is read before its (earlier) destination is written.
     for (size_t s = 0; s < samples; s++) {
-      s_pkt[s * 2 + 0] = s_pkt[s * 3 + 1];
-      s_pkt[s * 2 + 1] = s_pkt[s * 3 + 2];
+      int32_t v = (int32_t) (s_pkt[s * 3 + 0] | (s_pkt[s * 3 + 1] << 8) |
+                             ((uint32_t) s_pkt[s * 3 + 2] << 16));
+      if (v & 0x00800000) v |= (int32_t) 0xFF000000;   // sign-extend
+      v = (v + 128) >> 8;
+      if (v > 32767) v = 32767;
+      s_pkt[s * 2 + 0] = (uint8_t) (v & 0xFF);
+      s_pkt[s * 2 + 1] = (uint8_t) ((v >> 8) & 0xFF);
     }
   } else if (wire_bps == 4) {
     // 24-in-32 alt: place the 24-bit sample left-justified (MSB-aligned) in a
@@ -969,17 +1166,20 @@ static void submit_first_packet(void) { submit_packet(); }
 // packets are actually flowing (~1000/s expected at 48 kHz).
 static void on_iso_complete(tuh_xfer_t *xfer) {
   if (xfer->daddr != s_dac.dev_addr) return;
+  s_last_iso_ms = to_ms_since_boot(get_absolute_time());
 #if !DSPICO_USB_TRACE
   if ((++s_iso_pkts & 0x1FFF) == 0) {   // every 8192 packets ≈ 8 s
     // Rate must sit at ~1000 pkts/s (one per USB frame). Ring fill says where
     // a silence problem lives: ~0 with the PC playing means PC audio isn't
     // arriving (device side); large+stable means the path is healthy and any
-    // silence is downstream of us.
+    // silence is downstream of us. fb is the DAC-requested rate in
+    // milli-frames/packet (48000 = nominal; 0 = no feedback, fixed 48).
     const uint32_t ms = to_ms_since_boot(get_absolute_time()) - s_stream_t0_ms;
-    dlog("DSPico host: heartbeat — %lu pkts this stream (%lu pkts/s), play ring %lu B\n",
+    dlog("DSPico host: heartbeat — %lu pkts this stream (%lu pkts/s), play ring %lu B, fb %lu\n",
            (unsigned long) s_iso_pkts,
            (unsigned long) (ms ? (uint64_t) s_iso_pkts * 1000u / ms : 0),
-           (unsigned long) signal_path_play_fill());
+           (unsigned long) signal_path_play_fill(),
+           (unsigned long) (((uint64_t) s_fb_rate_q14 * 1000u) >> 14));
   }
 #endif
   submit_packet();
@@ -997,6 +1197,10 @@ static void dac_close(uint8_t dev_addr) {
   if (dev_addr != s_dac.dev_addr) return;
   disarm_step_watchdog();
   s_deferred_next = NULL;
+  s_fb_polling  = false;
+  s_fb_rate_q14 = 0;
+  s_fb_acc_q14  = 0;
+  s_fb_errors   = 0;
   dlog("DSPico host: DAC disconnected\n");
   memset(&s_dac, 0, sizeof(s_dac));
   s_desc_len = s_desc_pos = 0;   // re-dump the descriptor on the next attach

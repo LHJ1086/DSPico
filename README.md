@@ -348,8 +348,9 @@ green (streaming to DAC); red = incompatible DAC (see the table above).
 
 **Phase 1b — host** (Type-C2 → DAC) — *the real test*:
 - Plug in one known class-compliant USB DAC. The firmware sets it to 48 kHz,
-  opens its iso OUT endpoint, and streams a 1 kHz tone. LED goes **green**.
-- **GATE:** a clean, continuous 1 kHz tone from the DAC for several minutes,
+  opens its iso OUT endpoint, and streams continuously (silence until the PC
+  plays audio — there is no test tone). LED goes **green**.
+- **GATE:** clean, continuous playback from the DAC for several minutes,
   verified **by ear and on a logic analyzer / USB trace**.
 
 🚦 **If 1b cannot be stabilised, stop.** Switch platforms per brief §10
@@ -368,9 +369,16 @@ green (streaming to DAC); red = incompatible DAC (see the table above).
 - **Priming** — playback toward the DAC starts only after ~8 ms of audio is
   buffered (`SIGNAL_PATH_PRIME_BYTES`), so a stream opens with a cushion
   instead of stuttering on scheduling jitter; an underrun silently re-primes.
-- **Underrun = silence, not tone** — while the PC is streaming, any gap is
-  filled with silence. The 1 kHz test tone plays only when *no* PC stream is
-  active (bench/gate mode).
+- **Idle & underrun = silence** — whenever the play ring has nothing (no PC
+  stream, priming, or a momentary underrun) the DAC is fed silent packets.
+  The bridge never generates sound of its own; the old bring-up test tone is
+  gone.
+- **Clip guard** — the EQ engine automatically reserves headroom equal to the
+  largest band boost (effective pre-gain = min(user pre-gain, −max boost)),
+  so a boosted band driven by full-scale audio no longer hard-clips.
+- **DAC clock tracking** — for an asynchronous DAC with a feedback endpoint,
+  the host reads the DAC's requested rate and sizes packets 47/48/49 frames
+  to match its clock, instead of drifting into periodic clicks.
 - **Overflow drops whole frames** — if the PC sends while no DAC drains, the
   cross-core ring drops complete frames (newest first) and never shifts the
   producer/consumer frame alignment (regression-tested in `tests/path_test.c`).
@@ -409,7 +417,6 @@ src/
   signal_path.[ch]       pre-gain -> PEQ -> host volume -> play ring    <<<
   audio_ring.h           lock-free cross-core SPSC audio ring
   config_usb.[ch]        WebUSB vendor protocol + flash-persisted presets <<<
-  test_tone.[ch]         48 kHz / 24-bit sine generator (idle/gate fallback)
   status_led.[ch]        WS2812 state indicator (on PIO2, no conflict)
   ws2812.pio             LED PIO program (assembled at build time)
   main.c                 clock, dual-core split, both stacks, EQ wiring

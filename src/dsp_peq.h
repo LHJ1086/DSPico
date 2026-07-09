@@ -58,10 +58,13 @@ typedef struct { float ic1eq, ic2eq; }           svf_state_t;   // 2 integrators
 
 typedef struct {
   float           fs;                 // sample rate, Hz
-  float           pre_gain;           // linear, applied before the bands
+  float           pre_gain;           // linear, USER pre-gain (as configured)
+  float           clip_guard;         // linear, -(largest band boost) — auto headroom
+  float           pre_eff;            // min(pre_gain, clip_guard): gain actually applied
   float           host_gain;          // TARGET host gain (UAC2 volume/mute)
   float           host_gain_cur;      // applied gain, slewed toward host_gain
   float           gain_step;          // per-frame slew step (~5 ms full scale)
+  uint8_t         n_active;           // count of active bands (fast-path check)
   bool            band_active[PEQ_MAX_BANDS];  // enabled AND not identity
   peq_band_t      band[PEQ_MAX_BANDS];
   svf_coeffs_t    coeffs[PEQ_MAX_BANDS];
@@ -79,7 +82,17 @@ void peq_set_band(peq_t *p, uint8_t idx, const peq_band_t *band);
 // config/UI layer can round-trip the same values the device will actually use.
 void peq_clamp_band(peq_band_t *band);
 
-// Global pre-gain / host-volume. Rule of thumb: pre_gain_db <= -(max band boost).
+// Global pre-gain / host-volume.
+//
+// CLIP GUARD: the engine automatically reserves headroom for band boosts. The
+// gain actually applied ahead of the filters is min(user pre-gain, -(largest
+// positive peaking/shelf gain)), so a boosted band driven by full-scale audio
+// can no longer slam the 24-bit output into hard clipping. A user pre-gain
+// LOWER than the guard is honoured as-is; a cut-only or flat EQ applies the
+// user pre-gain unchanged. (Overlapping boosts summing above any single band,
+// or a high-Q low/highpass resonance, can still exceed the guard — set an
+// explicit pre-gain for extreme curves.)
+//
 // peq_set_host_gain sets a TARGET: the applied gain slews toward it per frame
 // (full scale in ~5 ms) so OS volume steps and mutes never click. Use the
 // _now variant to snap both (e.g. on a config reset, to avoid a ramp through
