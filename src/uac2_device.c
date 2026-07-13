@@ -103,6 +103,19 @@ bool tud_audio_feedback_format_correction_cb(uint8_t func_id) {
 }
 
 // ---------------------------------------------------------------------------
+// Async feedback constants (shared by the stream-open arming below and the
+// steady-state controller in uac2_feedback_task).
+//
+// Nominal feedback value: samples per 1 ms frame in 16.16 fixed point.
+// (TinyUSB converts to the 10.14 full-speed wire format when sending.)
+#define FB_NOMINAL_16_16   ((uint32_t) DSPICO_SAMPLES_PER_MS << 16)
+// Regulate the ring to half-full and never ask for more than ±0.5 samples per
+// frame of correction (±32768 in 16.16) — gentle, unconditionally stable, and
+// still recovers a fully skewed ring in about 1.5 s.
+#define FB_TARGET_BYTES    (AUDIO_RING_CAP / 2)
+#define FB_MAX_DELTA_16_16 32768
+
+// ---------------------------------------------------------------------------
 // Streaming start/stop
 // ---------------------------------------------------------------------------
 bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_request) {
@@ -116,6 +129,31 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
     if (on) {
       signal_path_on_stream_start();               // clear filter history
       signal_path_set_host_gain(uac2_host_gain()); // apply current volume/mute
+
+      // Arm the async feedback endpoint to the nominal rate RIGHT HERE, from
+      // inside the SET_INTERFACE(alt 1) that just opened it — TinyUSB has, by
+      // this point, already opened the feedback IN endpoint (the callback fires
+      // at the end of audiod_set_interface, after every EP is activated).
+      //
+      // Why this fixes the iOS "player freezes on first connect, works after a
+      // replug" report: TinyUSB's audiod opens the feedback IN endpoint but
+      // never queues an initial packet — the first feedback is only sent when
+      // the application calls tud_audio_fb_set(). We otherwise do that from the
+      // core0 main loop (uac2_feedback_task), which runs only AFTER tud_task()
+      // returns. On the FIRST connect that same tud_task() call is still
+      // draining iOS's burst of enumeration / stream-setup control transfers
+      // (SET_INTERFACE, the Feature-Unit volume+mute SETs, the clock/range
+      // GETs) while core1 simultaneously brings up the downstream DAC over the
+      // slow PIO-USB port — so the feedback EP can sit un-armed (NAKing every
+      // poll) for several milliseconds right at stream start. iOS's audio clock
+      // estimator, given no feedback at that critical moment, wedges and the
+      // player freezes; a replug reuses iOS's cached descriptors, issues far
+      // fewer setup transfers, and so happens to arm feedback in time. Sending
+      // the nominal value synchronously here makes iOS's very first feedback
+      // poll return a valid 48.0 samples/frame with zero dependence on
+      // main-loop timing or cross-core contention. The feedback task then takes
+      // over the fine (ring-fill) correction as before.
+      tud_audio_fb_set(FB_NOMINAL_16_16);
     }
     set_streaming(on);
   }
@@ -202,15 +240,8 @@ void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf,
   feedback_param->sample_freq = DSPICO_SAMPLE_RATE_HZ;
 }
 
-// Nominal feedback value: samples per 1 ms frame in 16.16 fixed point.
-// (TinyUSB converts to the 10.14 full-speed wire format when sending.)
-#define FB_NOMINAL_16_16   ((uint32_t) DSPICO_SAMPLES_PER_MS << 16)
-// Regulate the ring to half-full and never ask for more than ±0.5 samples per
-// frame of correction (±32768 in 16.16) — gentle, unconditionally stable, and
-// still recovers a fully skewed ring in about 1.5 s.
-#define FB_TARGET_BYTES    (AUDIO_RING_CAP / 2)
-#define FB_MAX_DELTA_16_16 32768
-
+// (Feedback constants FB_NOMINAL_16_16 / FB_TARGET_BYTES / FB_MAX_DELTA_16_16
+// are defined above the streaming-start callback, which also arms the nominal.)
 void uac2_feedback_task(void) {
   static uint32_t last_ms;
   static uint32_t fill_avg;   // EMA of the ring fill, in bytes
